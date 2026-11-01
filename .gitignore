@@ -1,0 +1,16 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+captures/
+*.apk
+*.keystore
+*.jks
+.claude/
+CLAUDE.local.md
+*.jpg
+*.jpeg
+*.png
+*.heic

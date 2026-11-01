@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RemotePushButton</string>
+    <string name="device_channel">Device service</string>
+    <string name="device_notification">Ready to press</string>
+</resources>
