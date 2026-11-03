@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.os.SystemClock
 import android.util.Base64
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.serialization.Serializable
@@ -17,6 +18,9 @@ import net.rpb.core.lock.PinState
 import net.rpb.core.ocr.DisplayAnchor
 import net.rpb.core.ocr.SevenSegConfig
 import net.rpb.core.protocol.SeqStore
+import net.rpb.core.vault.SecretVault
+import net.rpb.core.vault.Vault
+import net.rpb.core.vault.VaultFiles
 
 enum class Mode { DEVICE, CONTROLLER }
 
@@ -43,6 +47,13 @@ data class DeviceSettings(
     /** Keep full-size photos and job calibrations in app storage, for pulling with adb (ADR 0023). */
     val saveDiagnostics: Boolean = false,
 ) {
+    /**
+     * Whether the running service must restart for [updated] to apply: it builds its relay from these at start,
+     * and reads every other setting when it uses it (ADR 0032).
+     */
+    fun needsRestart(updated: DeviceSettings) =
+        updated.deviceBroker != deviceBroker || updated.deviceId != deviceId || updated.relayId != relayId
+
     companion object {
         const val RELAY_ID_BYTES = 8
     }
@@ -68,28 +79,57 @@ private data class Secrets(
 )
 
 /**
- * App state. Everything secret (broker passwords, pairing keys, the PIN hash) lives in one Keystore-encrypted
- * blob; only the mode and replay counters are stored in plain preferences.
+ * App state. Everything secret (broker passwords, pairing keys, the PIN hash) lives in a [SecretVault]: one blob
+ * encrypted with a random data key, which the Keystore key wraps (ADR 0028). Only the mode and replay counters are
+ * stored in plain preferences.
  */
 class Store(context: Context) {
     private val appContext = context.applicationContext
     private val prefs = context.getSharedPreferences("rpb", Context.MODE_PRIVATE)
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    private val keystore = KeystoreBox(appContext)
+
+    private val secrets = SecretVault(
+        keys = keystore,
+        files = object : VaultFiles {
+            override fun wrappedKey() = prefs.getString(DATA_KEY, null)?.let { Base64.decode(it, Base64.NO_WRAP) }
+            override fun blob() = prefs.getString(SECRETS, null)?.let { Base64.decode(it, Base64.NO_WRAP) }
+            override fun commit(wrappedKey: ByteArray, blob: ByteArray) = prefs.edit()
+                .putString(DATA_KEY, Base64.encodeToString(wrappedKey, Base64.NO_WRAP))
+                .putString(SECRETS, Base64.encodeToString(blob, Base64.NO_WRAP))
+                .commit()
+            override fun saveBlob(blob: ByteArray) = prefs.edit().putString(SECRETS, Base64.encodeToString(blob, Base64.NO_WRAP)).apply()
+        },
+        encode = { json.encodeToString(Secrets.serializer(), it).encodeToByteArray() },
+        // A device setting saved before a field was added gets its default (a random relayId), which is saved back.
+        decode = { plain ->
+            val loaded = plain?.let { json.decodeFromString(Secrets.serializer(), it.decodeToString()) } ?: Secrets()
+            loaded.copy(device = loaded.device ?: DeviceSettings())
+        },
+        log = { Log.i("RPB", it) },
+    )
+
+    /** Whether the secrets can be read; the flows below hold placeholders until they are [Vault.OPEN]. */
+    val vault: StateFlow<Vault> = secrets.state
 
     private val _mode = MutableStateFlow(prefs.getString("mode", null)?.let { Mode.valueOf(it) })
     val mode: StateFlow<Mode?> = _mode
 
-    private var secrets: Secrets = loadSecrets()
-    // Saved back right away, so a field added since the last save (a random relayId) is fixed from now on.
-    private val _device = MutableStateFlow((secrets.device ?: DeviceSettings()).also { saveSecrets(secrets.copy(device = it)) })
+    // Placeholders until the secrets are open; nothing is saved while they are closed.
+    private val _device = MutableStateFlow(DeviceSettings())
     val device: StateFlow<DeviceSettings> = _device
-    private val _controllers = MutableStateFlow(secrets.controllers)
+    private val _controllers = MutableStateFlow<List<StoredController>>(emptyList())
     val controllers: StateFlow<List<StoredController>> = _controllers
-    private val _pairings = MutableStateFlow(secrets.pairings)
+    private val _pairings = MutableStateFlow<List<StoredPairing>>(emptyList())
     val pairings: StateFlow<List<StoredPairing>> = _pairings
 
     // Lockouts run on the time since boot, which can't be set forward like the wall clock (ADR 0024).
-    val pinLock = PinLock(load = { secrets.pin }, save = { pin -> synchronized(this) { saveSecrets(secrets.copy(pin = pin)) } }, clock = SystemClock::elapsedRealtime)
+    val pinLock = PinLock(
+        load = { secrets.value?.pin },
+        // Only reachable while the secrets are open: the PIN prompt and settings show on top of them.
+        save = { pin -> synchronized(this) { update { it.copy(pin = pin) } } },
+        clock = SystemClock::elapsedRealtime,
+    )
 
     val seqStore: SeqStore = object : SeqStore {
         override fun lastSeq(controllerId: String) = prefs.getLong("seq_$controllerId", 0L)
@@ -103,47 +143,61 @@ class Store(context: Context) {
         _mode.value = mode
     }
 
+    /** Opens the secrets ([SecretVault.open]): Keystore work, so off the main thread. */
     @Synchronized
-    fun updateDevice(transform: (DeviceSettings) -> DeviceSettings) {
-        val updated = transform(_device.value)
-        saveSecrets(secrets.copy(device = updated))
-        _device.value = updated
+    fun open(): Vault {
+        val state = secrets.open()
+        secrets.value?.let(::publish)
+        return state
     }
 
+    /** [KeystoreBox.describe] as logged when the secrets first opened in this process. */
+    val keyDescription: String? get() = secrets.keyDescription
+
+    /** Where the Keystore key lives, for the PIN lock dialog (ADR 0029). Keystore work, so off the main thread. */
+    fun keyStorage(): String? = keystore.storage()
+
+    /** Forgets the data key and the secrets (ADR 0028); [open] reads them again through the Keystore. */
     @Synchronized
-    fun addController(controller: StoredController) {
-        val list = _controllers.value + controller
-        saveSecrets(secrets.copy(controllers = list))
-        _controllers.value = list
+    fun close() {
+        secrets.close()
+        _pairings.value = emptyList()
+        _controllers.value = emptyList()
+        _device.value = DeviceSettings()
     }
 
-    @Synchronized
-    fun removeController(id: String) {
-        val list = _controllers.value.filterNot { it.id == id }
-        saveSecrets(secrets.copy(controllers = list))
-        _controllers.value = list
-    }
+    // The mutators save and return true while the secrets are open; while closed they change nothing and return
+    // false, since a UI callback can still arrive after a controller locked (ADR 0028).
 
     @Synchronized
-    fun addPairing(pairing: StoredPairing) {
-        val list = _pairings.value.filterNot { it.code == pairing.code } + pairing
-        saveSecrets(secrets.copy(pairings = list))
-        _pairings.value = list
-    }
+    fun updateDevice(transform: (DeviceSettings) -> DeviceSettings) = update { it.copy(device = transform(checkNotNull(it.device))) }
+
+    @Synchronized
+    fun addController(controller: StoredController) = update { it.copy(controllers = it.controllers + controller) }
+
+    @Synchronized
+    fun removeController(id: String) = update { s -> s.copy(controllers = s.controllers.filterNot { it.id == id }) }
+
+    @Synchronized
+    fun addPairing(pairing: StoredPairing) = update { s -> s.copy(pairings = s.pairings.filterNot { it.code == pairing.code } + pairing) }
 
     /** Replaces the pairing with the same code, keeping its place in the list. */
     @Synchronized
-    fun updatePairing(pairing: StoredPairing) {
-        val list = _pairings.value.map { if (it.code == pairing.code) pairing else it }
-        saveSecrets(secrets.copy(pairings = list))
-        _pairings.value = list
-    }
+    fun updatePairing(pairing: StoredPairing) = update { s -> s.copy(pairings = s.pairings.map { if (it.code == pairing.code) pairing else it }) }
 
     @Synchronized
-    fun removePairing(code: String) {
-        val list = _pairings.value.filterNot { it.code == code }
-        saveSecrets(secrets.copy(pairings = list))
-        _pairings.value = list
+    fun removePairing(code: String) = update { s -> s.copy(pairings = s.pairings.filterNot { it.code == code }) }
+
+    private fun update(transform: (Secrets) -> Secrets): Boolean {
+        val updated = secrets.update(transform) ?: return false
+        publish(updated)
+        return true
+    }
+
+    private fun publish(value: Secrets) {
+        _device.value = checkNotNull(value.device)
+        _controllers.value = value.controllers
+        _pairings.value = value.pairings
     }
 
     /**
@@ -156,18 +210,11 @@ class Store(context: Context) {
         prefs.edit().clear().commit()
         appContext.filesDir.listFiles()?.forEach { it.deleteRecursively() }
         appContext.cacheDir.listFiles()?.forEach { it.deleteRecursively() }
-        KeystoreBox.deleteKey()
+        keystore.deleteKeys()
     }
 
-    private fun loadSecrets(): Secrets {
-        val stored = prefs.getString("secrets", null) ?: return Secrets()
-        val plain = KeystoreBox.decrypt(Base64.decode(stored, Base64.NO_WRAP))
-        return json.decodeFromString(Secrets.serializer(), plain.decodeToString())
-    }
-
-    private fun saveSecrets(updated: Secrets) {
-        secrets = updated
-        val blob = KeystoreBox.encrypt(json.encodeToString(Secrets.serializer(), updated).encodeToByteArray())
-        prefs.edit().putString("secrets", Base64.encodeToString(blob, Base64.NO_WRAP)).apply()
+    private companion object {
+        const val SECRETS = "secrets"
+        const val DATA_KEY = "data_key"
     }
 }

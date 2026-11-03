@@ -12,10 +12,24 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-    <!-- We connect to the Bot by MAC address and never scan, so no location / BLUETOOTH_SCAN needed. -->
+    <!-- The screen-lock prompt that opens the Keystore key on API 30 and later (ADR 0028). -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- We connect to the Bot by MAC address. The first connect, and the one after a failed attempt, first scans
+         for that address, since after a reboot a direct connect never completes (ADR 0031). The scan never derives
+         location; Android 11 and below still need the location permission, and location on, to scan. Without them
+         the Bot is connected without a scan. -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <!-- Declared up to Android 11 only, so lint's call for COARSE beside FINE on Android 12 and higher doesn't apply. -->
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30"
+        tools:ignore="CoarseFineLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="s" />
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />

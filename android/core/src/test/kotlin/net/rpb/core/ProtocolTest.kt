@@ -61,6 +61,16 @@ class ProtocolTest {
         assertNull((Codec.decodeCommand(Codec.encode(CalibPhoto(9, 5000, "gh78"))) as CalibPhoto).pressDelayMs)
         assertEquals(CalibrationState("cd34", calibration), Codec.decodeEvent(Codec.encode(CalibrationState("cd34", calibration))))
 
+        // The controller's ephemeral key travels as a byte string; older controllers leave it out (ADR 0030).
+        val epk = Random(2).nextBytes(32)
+        val withKey = Codec.decodeCommand(Codec.encode(Press(10, 6000, "ij90", 3000, epk)))
+        assertIs<Press>(withKey)
+        assertContentEquals(epk, withKey.epk)
+        assertTrue(Codec.encode(Press(10, 6000, "ij90", 3000, epk)).size <= Codec.encode(Press(10, 6000, "ij90", 3000)).size + 32 + 6)
+        assertNull((Codec.decodeCommand(Codec.encode(press)) as Press).epk)
+        assertContentEquals(epk, (Codec.decodeCommand(Codec.encode(CalibPhoto(11, 7000, "kl12", epk = epk))) as CalibPhoto).epk)
+        assertContentEquals(epk, (Codec.decodeCommand(Codec.encode(set.copy(epk = epk))) as SetCalibration).epk)
+
         val bytes = Random(1).nextBytes(1000)
         val chunk = Codec.decodeEvent(Codec.encode(PhotoChunk("j", 0, 1, bytes)))
         assertIs<PhotoChunk>(chunk)

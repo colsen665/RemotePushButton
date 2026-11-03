@@ -27,20 +27,35 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import net.rpb.app.common.KeyScreen
 import net.rpb.app.common.LockScreen
 import net.rpb.app.common.Mode
+import net.rpb.app.common.ScreenLockPrompt
 import net.rpb.app.controller.ControllerScreen
 import net.rpb.app.device.DeviceScreen
 import net.rpb.app.ui.RpbTheme
 import net.rpb.core.lock.PinLock
+import net.rpb.core.vault.Vault
 import java.text.DateFormat
 import java.util.Date
 
 class MainActivity : ComponentActivity() {
     private var locked by mutableStateOf(false)
+    private lateinit var screenLock: ScreenLockPrompt
+    private var opening by mutableStateOf(false)
+    private var prompting = false
+    private var keyMessage by mutableStateOf<String?>(null)
+
+    /** The secrets were closed at start: whether the app PIN applies can only be read once they are open. */
+    private var pinPending = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        screenLock = ScreenLockPrompt(this)
         enableEdgeToEdge()
         // Keeps codes and pairing QRs out of Recents thumbnails and screenshots (ADR 0020).
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
@@ -52,7 +67,10 @@ class MainActivity : ComponentActivity() {
                         BuildStamp()
                         Box(Modifier.weight(1f)) {
                             val mode by app.store.mode.collectAsStateWithLifecycle()
-                            if (locked) {
+                            val vault by app.store.vault.collectAsStateWithLifecycle()
+                            if (vault != Vault.OPEN) {
+                                KeyScreen(vault, opening, keyMessage, onUnlock = ::openStore, onErase = app::wipeAndRestart)
+                            } else if (locked) {
                                 LockScreen(
                                     app.store.pinLock,
                                     onUnlocked = {
@@ -75,9 +93,53 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // PIN lock (ADR 0015): on start, and when coming back after more than a minute away. Locking clears the history (ADR 0026).
+    // PIN lock (ADR 0015): on start, and when coming back after more than a minute away. Locking clears the history
+    // (ADR 0026) and, on a controller, forgets the data key (ADR 0028). The PIN lives in the secrets, so they open first.
     override fun onStart() {
         super.onStart()
+        val app = rpb
+        if (app.store.vault.value != Vault.OPEN) {
+            pinPending = true
+            if (!prompting && app.store.vault.value != Vault.LOST) openStore()
+        } else if (app.store.pinLock.isSet && PinLock.needsUnlock(app.lastActive, SystemClock.elapsedRealtime())) {
+            locked = true
+            app.lock()
+            if (app.store.mode.value == Mode.CONTROLLER) {
+                app.store.close()
+                openStore()
+            }
+        }
+    }
+
+    /** Unwraps the data key; if the Keystore wants the screen lock first, asks for it once and tries again. */
+    private fun openStore() = openStore(prompt = true)
+
+    private fun openStore(prompt: Boolean) {
+        if (opening) return
+        opening = true
+        keyMessage = null
+        lifecycleScope.launch {
+            val app = rpb
+            val vault = withContext(Dispatchers.IO) { app.store.open() }
+            opening = false
+            when {
+                vault == Vault.OPEN -> onStoreOpened()
+                vault == Vault.CLOSED && prompt -> {
+                    prompting = true
+                    screenLock.ask { passed ->
+                        prompting = false
+                        if (passed) openStore(prompt = false) else keyMessage = "The screen lock wasn't passed."
+                    }
+                }
+                vault == Vault.CLOSED -> keyMessage = "The keys didn't open. Try again."
+                else -> Unit
+            }
+        }
+    }
+
+    private fun onStoreOpened() {
+        if (!pinPending) return
+        pinPending = false
         val app = rpb
         if (app.store.pinLock.isSet && PinLock.needsUnlock(app.lastActive, SystemClock.elapsedRealtime())) {
             locked = true
@@ -126,8 +188,8 @@ private fun ModeChooser(onPick: (Mode) -> Unit) {
             Text("Device — the phone mounted next to the SwitchBot")
         }
         Text(
-            "Device mode makes this app the phone's home screen so it restarts by itself after a reboot. " +
-                "Use it only on a dedicated phone.",
+            "Device mode makes this app the phone's home screen, so it comes back after a reboot once the phone " +
+                "is unlocked. Use it only on a dedicated phone.",
             style = MaterialTheme.typography.bodySmall,
         )
     }

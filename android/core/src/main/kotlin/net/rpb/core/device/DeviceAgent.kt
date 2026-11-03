@@ -35,6 +35,7 @@ import net.rpb.core.protocol.DigitResult
 import net.rpb.core.protocol.ErrorCodes
 import net.rpb.core.protocol.ErrorEvent
 import net.rpb.core.protocol.Event
+import net.rpb.core.protocol.JobCommand
 import net.rpb.core.protocol.PhotoChunk
 import net.rpb.core.protocol.Press
 import net.rpb.core.protocol.ReplayGuard
@@ -171,8 +172,21 @@ class DeviceAgent(
             log("dropped replayed/stale command from ${controller.name}")
             return
         }
+        // A job's events go under a key that is gone once the job ends (ADR 0030); older controllers send no epk.
+        val epk = (command as? JobCommand)?.epk
+        val seal: (ByteArray) -> ByteArray = if (epk == null) {
+            { envelope.seal(Direction.EVT, it) }
+        } else {
+            val jobEnvelope = try {
+                envelope.deviceJob(epk)
+            } catch (e: EnvelopeException) {
+                log("dropped command with a bad job key from ${controller.name}")
+                return
+            }
+            jobEnvelope::seal
+        }
         val reply: suspend (Event) -> Unit = { event ->
-            relay.publish(Topics.evt(deviceHex, controllerHex), envelope.seal(Direction.EVT, Codec.encode(event)))
+            relay.publish(Topics.evt(deviceHex, controllerHex), seal(Codec.encode(event)))
         }
         when (command) {
             is Press -> {

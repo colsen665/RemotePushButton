@@ -4,19 +4,28 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import net.rpb.app.MainActivity
 import net.rpb.app.R
@@ -32,6 +41,7 @@ import net.rpb.core.protocol.ReplayGuard
 import net.rpb.core.relay.MqttRelay
 import net.rpb.core.relay.Topics
 import net.rpb.core.relay.Will
+import net.rpb.core.vault.Vault
 import java.io.File
 import java.util.Base64
 
@@ -48,11 +58,60 @@ class DeviceService : LifecycleService() {
     @Volatile
     private var botBatteryAt = 0L
 
+    private var unlockReceiver: BroadcastReceiver? = null
+
     override fun onCreate() {
         super.onCreate()
         startInForeground()
         acquireLocks()
+        lifecycleScope.launch {
+            val store = rpb.store
+            var vault = withContext(Dispatchers.IO) { store.open() }
+            if (vault == Vault.CLOSED) vault = waitForUnlock()
+            if (vault != Vault.OPEN) return@launch giveUp(vault)
+            DeviceRuntime.log("key storage: ${store.keyDescription}")
+            startDevice()
+        }
+    }
 
+    /**
+     * Android restarted the service while the phone was locked (a crash), so the data key can't be unwrapped yet
+     * (ADR 0028). Ask for an unlock, then go on: the unlock opens the Keystore key for 30 s. Returns once the
+     * store is open, or can't be opened without the app.
+     */
+    private suspend fun waitForUnlock(): Vault {
+        val store = rpb.store
+        DeviceRuntime.log("waiting for the phone to be unlocked")
+        updateNotification(getString(R.string.device_unlock_notification))
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                lifecycleScope.launch(Dispatchers.IO) { store.open() }
+            }
+        }
+        unlockReceiver = receiver
+        // The screen coming on also covers a phone unlocked without the keyguard, while the 30 s still run.
+        val filter = IntentFilter(Intent.ACTION_USER_PRESENT).apply { addAction(Intent.ACTION_SCREEN_ON) }
+        ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        // The app on screen may open the store first.
+        val vault = store.vault.first { it != Vault.CLOSED }
+        unregisterReceiver(receiver)
+        unlockReceiver = null
+        if (vault == Vault.OPEN) updateNotification(getString(R.string.device_notification))
+        return vault
+    }
+
+    /**
+     * No screen lock, or the keys are lost: only the app can sort that out, and its device screen starts the service
+     * again. Leaves an "Open the app" notification and stops, which releases the wake and Wi-Fi locks.
+     */
+    private fun giveUp(vault: Vault) {
+        DeviceRuntime.log(if (vault == Vault.LOST) "the app's keys can't be opened: open the app" else "no screen lock: open the app")
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_DETACH)
+        updateNotification(getString(R.string.device_open_app_notification), ongoing = false)
+        stopSelf()
+    }
+
+    private fun startDevice() {
         val store = rpb.store
         val settings = store.device.value
         val log: (String) -> Unit = DeviceRuntime::log
@@ -64,7 +123,7 @@ class DeviceService : LifecycleService() {
         DeviceRuntime.camera = camera
 
         // The MQTT client rejects an empty host, so without a broker there is no relay and no agent.
-        // Saving the broker settings restarts the service.
+        // Saving the broker settings restarts the service; every other setting is read when used (ADR 0032).
         val relay = settings.deviceBroker.takeIf { it.host.isNotBlank() }?.let { broker ->
             MqttRelay(
                 config = broker,
@@ -89,12 +148,15 @@ class DeviceService : LifecycleService() {
                 camera = camera,
                 calibration = object : CalibrationStore {
                     override fun load() = store.device.value.let { Calibration(it.ocr, it.photoRotation) }
-                    override fun save(calibration: Calibration) =
+                    override fun save(calibration: Calibration) {
                         store.updateDevice { it.copy(ocr = calibration.config, photoRotation = calibration.rotation) }
+                    }
 
                     override fun anchor() = store.device.value.anchor
 
-                    override fun saveAnchor(anchor: DisplayAnchor) = store.updateDevice { it.copy(anchor = anchor) }
+                    override fun saveAnchor(anchor: DisplayAnchor) {
+                        store.updateDevice { it.copy(anchor = anchor) }
+                    }
                 },
                 statusSource = BatteryStatus(this) { DeviceRuntime.botBattery.value },
                 scope = lifecycleScope,
@@ -132,11 +194,20 @@ class DeviceService : LifecycleService() {
                 if (withTimeoutOrNull(wait) { botBatteryRefresh.receive() } != null) delay(BOT_BATTERY_AFTER_PRESS_MS)
             }
         }
+        lifecycleScope.launch {
+            // Settings apply without a restart (ADR 0032), so read the battery of a newly set Bot here.
+            store.device.map { it.botMac to it.botPassword }.distinctUntilChanged().drop(1).collect {
+                DeviceRuntime.botBattery.value = null
+                botBatteryAt = 0
+                botBatteryRefresh.trySend(Unit)
+            }
+        }
         DeviceRuntime.running.value = true
         log("device service started")
     }
 
     override fun onDestroy() {
+        unlockReceiver?.let(::unregisterReceiver)
         // Clear the online flag before going away; the last will only covers unclean disconnects.
         runBlocking { withTimeoutOrNull(2_000) { agent?.stop() } }
         DeviceRuntime.camera = null
@@ -150,17 +221,25 @@ class DeviceService : LifecycleService() {
         super.onDestroy()
     }
 
+    private fun notification(text: String, ongoing: Boolean = true): Notification {
+        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        return Notification.Builder(this, CHANNEL)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(text)
+            .setSmallIcon(R.drawable.ic_launcher)
+            .setContentIntent(open)
+            .setOngoing(ongoing)
+            .build()
+    }
+
+    private fun updateNotification(text: String, ongoing: Boolean = true) {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text, ongoing))
+    }
+
     private fun startInForeground() {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL, getString(R.string.device_channel), NotificationManager.IMPORTANCE_LOW))
-        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        val notification = Notification.Builder(this, CHANNEL)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText(getString(R.string.device_notification))
-            .setSmallIcon(R.drawable.ic_launcher)
-            .setContentIntent(open)
-            .setOngoing(true)
-            .build()
+        val notification = notification(getString(R.string.device_notification))
         val types = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
         } else {

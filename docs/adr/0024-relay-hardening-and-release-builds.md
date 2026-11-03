@@ -1,6 +1,6 @@
 # 24. Relay hardening and release builds: random client IDs, broker ACLs, no codes in logcat, signed APKs
 
-- Status: Accepted
+- Status: Accepted; amended by [0028](0028-keystore-key-bound-to-the-screen-lock.md) (the device phone now has a screen lock, which also gates adb authorisation)
 - Date: 2026-10-19
 - Amends: [0006](0006-e2e-crypto-and-qr-pairing.md) (what revoking covers), [0011](0011-emqx-cloud-serverless-relay.md) (broker setup), [0015](0015-app-pin-lock-with-optional-wipe.md) (lockout clock, what the PIN protects against), [0020](0020-no-backup-transfer-or-screen-capture.md) and [0023](0023-optional-diagnostics-on-the-device.md) (debuggable builds)
 

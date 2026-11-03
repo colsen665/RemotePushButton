@@ -29,6 +29,8 @@ Keep the key file and its password: a release build signed with another key can'
 
 The debug build (`:app:assembleDebug`, `app-debug.apk`) is for pulling diagnostics off the device phone only (Troubleshooting). Switching between the two needs `adb uninstall net.rpb.app` first, which erases the app's data, so pair again afterwards.
 
+**Updating from a build before ADR 0028:** set a screen lock on the phone first (§4 step 1, §5 step 1), then install over the old build. On its first start the app asks for the screen lock and moves the pairings to the new key; nothing needs pairing again.
+
 The top line of every screen shows the installed build: `Build <n> · <commit> · <time>` is the number of commits, the commit (with `+` if built with uncommitted changes) and the build time.
 
 ## 3. SwitchBot Bot
@@ -39,9 +41,9 @@ The top line of every screen shows the installed build: `Build <n> · <commit> �
 3. Close the SwitchBot app on the device phone, or don't install it there. The Bot accepts only one connection at a time.
 
 ## 4. Device phone (the old Android)
-1. Factory reset. Set up Wi-Fi and **automatic date & time**; skip accounts where possible.
-2. Install the APK, open it and choose **Device**. Grant the camera, Bluetooth (nearby devices) and notification permissions.
-3. When Android asks, make **RemotePushButton** the default **Home** app ("Always").
+1. Factory reset. Set up Wi-Fi and **automatic date & time**; skip accounts where possible. Set a **screen lock** (a PIN) and keep it somewhere safe: the app's keys open only with it (ADR 0028). Removing it later erases the app's pairings.
+2. Install the APK and open it. It asks for the screen lock; then choose **Device**. Grant the camera, Bluetooth (nearby devices) and notification permissions. On Android 11 and below it asks for location too, and location must stay on: the app scans briefly for the Bot when the service starts and after a failed connect (ADR 0031). It never uses the location. Without that permission the device still runs, but may not reach the Bot after a reboot; the device screen then shows **Allow scanning**.
+3. When Android asks, make **RemotePushButton** the default **Home** app ("Always"). After a reboot the phone stops at its lock screen and the device stays offline until someone unlocks it; then the app comes back on screen and goes online. If the app crashes while the phone is locked, its notification says *Unlock the phone to bring the device back online*.
 4. Tap **Disable battery optimisation**.
    - **Asus phones:** also turn off the battery-drain detection, which kills the app regardless of the exemption: `adb shell settings put global asus_detect_bd_on 0` (check with `settings get`; a system update may reset it).
    - While USB debugging is on, `adb logcat -G 16M` keeps hours of the device log instead of minutes, until the next reboot. The log never contains codes.
@@ -62,8 +64,8 @@ The top line of every screen shows the installed build: `Build <n> · <commit> �
    3. Tap **Save**. The device remembers the display's surroundings (the LCD frame and the logo) and from then on follows the display if the mount moves by up to about two digit heights, so small movements don't need a new calibration (ADR 0018). Saved on the device itself, it learns them from the calibration photo right away, since tapping the phone can move it (ADR 0022); saved from a controller, at its first correct read.
 
    If **Find digits** doesn't find the code: check the code and the focus, and **Retake photo**. As a last resort, open **Adjust by hand…**: drag the yellow corners roughly around the digit row (pinch to zoom; zoomed in, drag off the corners to pan) and tap **Refine**; *Turn 90°*, the digit count, polarity and sliders are there too.
-9. Optional: under **PIN lock**, set a PIN, and choose whether 3 wrong PINs erase all app data. A wipe takes the device offline until it is set up and paired again.
-   Then turn **USB debugging** off (Developer options; **Revoke USB debugging authorisations** too). The phone has no screen lock, so anyone with a cable could otherwise authorise their computer. Turn it on again only to pull diagnostics or logs (ADR 0024).
+9. Optional: under **PIN lock**, set an app PIN, and choose whether 3 wrong PINs erase all app data. It guards the pairing QR and the settings from someone handed the unlocked phone; a wipe takes the device offline until it is set up and paired again. The same dialog shows **Key storage**: *StrongBox*, *hardware* or *software* (ADR 0029).
+   Then turn **USB debugging** off (Developer options; **Revoke USB debugging authorisations** too). Authorising a computer needs the screen lock, but the phone gets no security updates. Turn it on again only to pull diagnostics or logs (ADR 0024).
 10. **Charging:** the phone stays plugged in, so limit the charge to protect the lithium battery.
    - **Asus phones:** Settings → Battery → Battery care → **Charging limit**, set to **80%**. Charging pauses at 80% and resumes after a small drop. Turn on **Slow charging** too, which keeps the battery cooler. Those without bypass charging have no better option.
    - **Other phones:** turn on the charge limit if there is one (often "Protect battery" or "80% limit").
@@ -74,8 +76,9 @@ The top line of every screen shows the installed build: `Build <n> · <commit> �
 
 ## 5. Controller phone(s)
 1. On the device phone: **Controllers → Add controller**, enter a name, and keep the QR code on screen.
-2. On the controller phone: install the APK, choose **Controller**, tap **Scan pairing QR**, then close the QR dialog on the device.
-3. Optional: **PIN lock** sets a PIN for this phone.
+2. On the controller phone: make sure it has a **screen lock** (ADR 0028). Install the APK and open it; it asks for the screen lock. Choose **Controller**, tap **Scan pairing QR**, then close the QR dialog on the device.
+   - The app forgets its keys when it leaves the screen (60 s after, with an app PIN) and asks for the screen lock again if the phone was unlocked more than 30 s before.
+3. Optional: **PIN lock** sets an app PIN for this phone, asked after the screen lock. The screen lock already protects the keys; the app PIN adds a second step for someone handed the unlocked phone.
 4. Calibrate the device from here, if it isn't yet (§4 step 8): tap **Calibrate**. With **Press the button first** ticked, the device presses, waits the delay set for it and sends a photo. Enter the code in the photo, tap **Find digits**, then **Save**. The device saves the calibration, presses again and answers with its own read and a fresh photo.
 5. Tap **PRESS**. The code appears with a **Copy** button, and the photo follows below. The device photographs the display 3 s after the press; if the photo still shows the old code, tap **Photo 3 s after the press** and set a longer wait (up to 10 s, kept for each device).
 6. A lost phone? Use **Revoke** on the device phone. Then, on EMQX, change the `rpb-controllers` password, enter it in the device's Settings, **Save**, and pair the remaining controllers again with new QR codes: the old password stays in the lost phone and would still let it reach the broker (ADR 0024).
@@ -86,6 +89,7 @@ The top line of every screen shows the installed build: `Build <n> · <commit> �
 | Relay stays stopped | Broker host and credentials; the device phone's internet connection; the EMQX deployment isn't stopped for exceeding its monthly quota. The log at the bottom of the device screen shows the reason. `ConnectTimeoutException` usually means a mistyped host: any name under `emqxsl.com` resolves, but only the deployment's own host (`<id>.ala.<region>.emqxsl.com`, with dots) answers on port 8883 |
 | "Device offline" on the controller | The device service is running (its notification is showing); the phone has network access; battery optimisation is disabled; on Asus, `asus_detect_bd_on` is 0. `adb shell dumpsys activity exit-info net.rpb.app` shows why the app last stopped |
 | Press failed | Bot MAC address, Bot password (the same in both apps), Bot within about 5 m, Bluetooth on, SwitchBot app closed, Bot battery |
+| Presses time out connecting to the Bot after a reboot of the device phone ("Bot attempt failed (…Timed out…)" in the device log) | The app scans for the Bot before its first connect, so after a reboot the first battery read should succeed. If the log says "connecting to the Bot without a scan", grant the scan permission (**Allow scanning** on the device screen; on Android 11 and below, location, with location on). If it says "Bot not seen in a 5 s scan", check the Bot MAC address, the Bot's battery and range, and that the SwitchBot app isn't connected to it. As a stopgap, opening Android's Bluetooth **Pair new device** screen for a few seconds, without pairing anything, also makes the next press connect |
 | "Charging past 80 %" on the controller | The device phone's charge limit is on and set to 80%; a system update may have reset it. Otherwise use a smart plug (§4 step 10) |
 | "Battery is hot" on the controller | Direct sun or enclosed mounting (see the idle test in `TODO.md`) |
 | Wrong or amber digits | Re-calibrate from a controller with **Find digits**; if one digit washes out, tilt the light or camera against glare; check focus distance |
@@ -93,3 +97,6 @@ The top line of every screen shows the installed build: `Build <n> · <commit> �
 | Blank display in the photo, all digits `?` | A press while the display still shows a code turns the display off. Wait until the code has gone before pressing again |
 | Reads fail and the log doesn't say why | Install the debug build on the device phone (§2; uninstall first, and pair again). Turn on **Save diagnostics** in the device's Settings and press a few times. Then `adb shell run-as net.rpb.app ls files/diagnostics` lists each photo (`<ms>-photo-t<turn>.jpg`, turn it `<turn>`° clockwise to be upright) and each job's calibration (`<ms>-job-<id>.json`); copy one with `adb exec-out run-as net.rpb.app cat files/diagnostics/<name> > <name>`. The photos show codes: turn it off afterwards, which deletes them (ADR 0023), and put the release build back (ADR 0024) |
 | Ack timeout | The phones' clocks: commands are rejected if they differ by more than 120 s |
+| "Device offline" after a power cut or a reboot; the notification says *Unlock the phone…* | The device phone waits at its lock screen: unlock it (ADR 0028) |
+| "Set a screen lock first" | The phone has no screen lock; set one, then **Try again** |
+| "The app's data can't be opened" | The screen lock was removed, which destroys the app's key. **Erase and start again**, then set up and pair again |

@@ -72,6 +72,9 @@ private fun devicePermissions(): Array<String> = buildList {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) add(Manifest.permission.POST_NOTIFICATIONS)
 }.toTypedArray()
 
+// Asked for with the others, but the service runs without it: the Bot is then connected without a scan (ADR 0031).
+private fun requestedPermissions(): Array<String> = devicePermissions() + BotClient.scanPermissions()
+
 private fun Context.hasAll(permissions: Array<String>) =
     permissions.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
 
@@ -99,13 +102,19 @@ private fun DeviceHome(onCalibrate: () -> Unit, onSwitchMode: () -> Unit) {
     val scope = rememberCoroutineScope()
 
     var permissionsOk by remember { mutableStateOf(context.hasAll(devicePermissions())) }
+    var scanOk by remember { mutableStateOf(context.hasAll(BotClient.scanPermissions())) }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         permissionsOk = context.hasAll(devicePermissions())
+        scanOk = context.hasAll(BotClient.scanPermissions())
     }
     // Start the service from the foreground (required for camera access, ADR 0009).
     LaunchedEffect(permissionsOk) {
-        if (!permissionsOk) permissionLauncher.launch(devicePermissions())
+        if (!permissionsOk) permissionLauncher.launch(requestedPermissions())
         else if (!DeviceRuntime.running.value) DeviceService.start(context)
+    }
+    // After an update from a build without the scan, only the scan permission is missing: ask for it on its own.
+    LaunchedEffect(Unit) {
+        if (permissionsOk && !scanOk) permissionLauncher.launch(requestedPermissions())
     }
 
     var testMessage by remember { mutableStateOf<String?>(null) }
@@ -126,7 +135,10 @@ private fun DeviceHome(onCalibrate: () -> Unit, onSwitchMode: () -> Unit) {
             Text("Bot battery: ${botBattery?.let { "$it%" } ?: "unknown"}")
             if (!permissionsOk) {
                 Text("Camera / Bluetooth permission missing", color = Bad)
-                Button(onClick = { permissionLauncher.launch(devicePermissions()) }) { Text("Grant permissions") }
+                Button(onClick = { permissionLauncher.launch(requestedPermissions()) }) { Text("Grant permissions") }
+            } else if (!scanOk) {
+                Text("Permission to scan for the Bot missing — it may not connect after a reboot.", color = Bad)
+                OutlinedButton(onClick = { permissionLauncher.launch(requestedPermissions()) }) { Text("Allow scanning") }
             }
             val power = context.getSystemService(PowerManager::class.java)
             if (!power.isIgnoringBatteryOptimizations(context.packageName)) {
@@ -187,9 +199,11 @@ private fun DeviceHome(onCalibrate: () -> Unit, onSwitchMode: () -> Unit) {
         }
 
         SettingsSection(settings, onSave = { updated ->
+            // Only a broker change restarts: a press sent during the restart times out on the controller (ADR 0032).
+            val restart = running && settings.needsRestart(updated)
             store.updateDevice { updated }
             if (!updated.saveDiagnostics) Diagnostics(DeviceService.diagnosticsDir(context), { false }).clear()
-            if (running) {
+            if (restart) {
                 DeviceService.stop(context)
                 DeviceService.start(context)
             }
@@ -323,7 +337,8 @@ private fun SettingsSection(settings: DeviceSettings, onSave: (DeviceSettings) -
                     controllerBroker = BrokerConfig(host, p, tls, ctrlUser, ctrlPass),
                 ),
             )
-        }) { Text("Save (restarts service)") }
+        }) { Text("Save") }
+        Text("A broker change restarts the service, and a press sent meanwhile fails on the controller.", style = MaterialTheme.typography.bodySmall)
     }
 }
 

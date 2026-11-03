@@ -89,9 +89,8 @@ private fun ControllerHome(vm: ControllerViewModel, onCalibrate: () -> Unit, onS
     val ui by vm.ui.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
-    var scanError by remember { mutableStateOf<String?>(null) }
     val scanner = androidx.activity.compose.rememberLauncherForActivityResult(ScanContract()) { result ->
-        result.contents?.let { scanError = vm.addPairing(it) }
+        result.contents?.let(vm::addPairing)
     }
     val scan = {
         scanner.launch(
@@ -116,7 +115,7 @@ private fun ControllerHome(vm: ControllerViewModel, onCalibrate: () -> Unit, onS
             Text("Pair with a device", style = MaterialTheme.typography.headlineSmall)
             Text("On the device phone, open Controllers → Add controller and scan the QR code it shows.")
             Button(onClick = scan) { Text("Scan pairing QR") }
-            scanError?.let { Text(it, color = Bad) }
+            ui.scanError?.let { Text(it, color = Bad) }
             TextButton(onClick = { pinSettings = true }) { Text("PIN lock") }
             TextButton(onClick = onSwitchMode) { Text("This is the device phone…") }
             return@Column
@@ -209,7 +208,7 @@ private fun ControllerHome(vm: ControllerViewModel, onCalibrate: () -> Unit, onS
             OutlinedButton(onClick = onCalibrate, enabled = ui.connected && !ui.running) { Text("Calibrate") }
             OutlinedButton(onClick = scan) { Text("Pair another") }
         }
-        scanError?.let { Text(it, color = Bad) }
+        ui.scanError?.let { Text(it, color = Bad) }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = { confirmRemove = true }) { Text("Remove this device") }
             TextButton(onClick = { pinSettings = true }) { Text("PIN lock") }

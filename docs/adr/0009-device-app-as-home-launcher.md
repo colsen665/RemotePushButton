@@ -1,6 +1,6 @@
 # 9. The device app registers as the home launcher, and calibration uses still photos
 
-- Status: Accepted; amended by [0016](0016-locate-digits-from-the-code-and-remote-calibration.md) (calibration also runs remotely from controllers)
+- Status: Accepted; amended by [0016](0016-locate-digits-from-the-code-and-remote-calibration.md) (calibration also runs remotely from controllers) and [0028](0028-keystore-key-bound-to-the-screen-lock.md) (after a reboot the app comes on screen once the phone is unlocked, not before)
 - Date: 2026-10-15
 
 ## Context

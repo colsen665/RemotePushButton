@@ -15,6 +15,7 @@ class EnvelopeException(message: String, cause: Throwable? = null) : Exception(m
 class Envelope(keys: SessionKeys, private val deviceId: ByteArray, private val controllerId: ByteArray) {
     private val cmdAead = XChaCha20Poly1305(keys.cmd)
     private val evtAead = XChaCha20Poly1305(keys.evt)
+    private val evtKey = keys.evt
 
     fun seal(direction: Direction, plaintext: ByteArray): ByteArray {
         // Tink output is nonce(24) | ciphertext | tag(16).
@@ -29,6 +30,26 @@ class Envelope(keys: SessionKeys, private val deviceId: ByteArray, private val c
         } catch (e: GeneralSecurityException) {
             throw EnvelopeException("authentication failed", e)
         }
+    }
+
+    /**
+     * The device's side of a job with forward secrecy (ADR 0030): answers the controller's [controllerEpk] with a
+     * fresh key pair, whose private half is erased before this returns.
+     */
+    fun deviceJob(controllerEpk: ByteArray): JobEnvelope {
+        val pair = JobKeyPair.generate()
+        try {
+            val key = JobKeys.derive(evtKey, pair.private, controllerEpk, controllerEpk, pair.public)
+            return JobEnvelope(key, pair.public, deviceId, controllerId)
+        } finally {
+            pair.destroy()
+        }
+    }
+
+    /** The controller's side of a job, once [deviceEpk] has arrived in the header of the job's first event. */
+    fun controllerJob(pair: JobKeyPair, deviceEpk: ByteArray): JobEnvelope {
+        val key = JobKeys.derive(evtKey, pair.private, deviceEpk, pair.public, deviceEpk)
+        return JobEnvelope(key, deviceEpk.copyOf(), deviceId, controllerId)
     }
 
     private fun aead(direction: Direction) = when (direction) {

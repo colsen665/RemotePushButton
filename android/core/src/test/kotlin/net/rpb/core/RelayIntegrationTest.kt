@@ -2,6 +2,9 @@ package net.rpb.core
 
 import io.moquette.broker.Server
 import io.moquette.broker.config.MemoryConfig
+import io.moquette.interception.AbstractInterceptHandler
+import io.moquette.interception.messages.InterceptPublishMessage
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -10,12 +13,17 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import net.rpb.core.controller.ControllerClient
 import net.rpb.core.controller.PressUpdate
 import net.rpb.core.crypto.BrokerConfig
+import net.rpb.core.crypto.Direction
+import net.rpb.core.crypto.EnvelopeException
+import net.rpb.core.crypto.JobEnvelope
+import net.rpb.core.crypto.JobKeyPair
 import net.rpb.core.crypto.Keys
 import net.rpb.core.crypto.PairingCode
 import net.rpb.core.crypto.toHex
@@ -32,7 +40,14 @@ import net.rpb.core.ocr.GrayImage
 import net.rpb.core.ocr.Move
 import net.rpb.core.ocr.Point
 import net.rpb.core.ocr.RowCrop
+import net.rpb.core.protocol.Ack
+import net.rpb.core.protocol.Codec
+import net.rpb.core.protocol.Command
 import net.rpb.core.protocol.InMemorySeqStore
+import net.rpb.core.protocol.JobCommand
+import net.rpb.core.protocol.PhotoChunk
+import net.rpb.core.protocol.Press
+import net.rpb.core.protocol.TextResult
 import net.rpb.core.protocol.ReplayGuard
 import net.rpb.core.protocol.SeqCounter
 import net.rpb.core.protocol.Status
@@ -41,14 +56,17 @@ import net.rpb.core.relay.Topics
 import net.rpb.core.relay.Will
 import java.net.ServerSocket
 import java.util.Properties
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
@@ -103,12 +121,13 @@ class RelayIntegrationTest {
                     setProperty("netty.mqtt.message_size", (1024 * 1024).toString())
                 },
             ),
+            listOf(onlineStored),
         )
         brokerConfig = BrokerConfig("127.0.0.1", port, tls = false)
 
         sniffer = MqttRelay(brokerConfig, "sniffer")
         sniffer.subscribe("#") { topic, payload -> sniffed += topic to payload }
-        sniffer.start()
+        runBlocking { startSubscribed(sniffer) }
 
         val deviceRelay = MqttRelay(brokerConfig, "device", Will(Topics.online(deviceHex), "0".toByteArray()))
         agent = DeviceAgent(
@@ -152,6 +171,31 @@ class RelayIntegrationTest {
             scope = scope,
         )
         agent.start()
+        assertTrue(deviceOnline.await(10, TimeUnit.SECONDS), "the device never raised its online flag")
+    }
+
+    /**
+     * Moquette 0.17 hands a retained publish to the current subscribers before it stores it, and a subscribe adds the
+     * subscription before it reads the store. A controller subscribing at that moment gets neither, and never sees the
+     * device online. So tests start once the broker holds the flag, which interceptors hear of only after it is stored.
+     */
+    private val deviceOnline = CountDownLatch(1)
+    private val onlineStored = object : AbstractInterceptHandler() {
+        override fun getID() = "online-stored"
+
+        override fun onSessionLoopError(error: Throwable) = Unit
+
+        override fun onPublish(msg: InterceptPublishMessage) {
+            if (msg.topicName == Topics.online(deviceHex) && msg.payload.toString(Charsets.UTF_8) == "1") deviceOnline.countDown()
+        }
+    }
+
+    /** `connected` turns true before the subscriptions are back; onConnected runs once they are. */
+    private suspend fun startSubscribed(relay: MqttRelay) {
+        val subscribed = CompletableDeferred<Unit>()
+        relay.onConnected { subscribed.complete(Unit) }
+        relay.start()
+        withTimeout(10_000) { subscribed.await() }
     }
 
     @AfterTest
@@ -169,11 +213,12 @@ class RelayIntegrationTest {
         return PairingCode(deviceId = deviceId, controllerId = controllerId, key = key, broker = brokerConfig, deviceName = "test")
     }
 
-    private fun controller(pairing: PairingCode, ackTimeoutMs: Long = 5_000) = ControllerClient(
+    private fun controller(pairing: PairingCode, ackTimeoutMs: Long = 5_000, log: (String) -> Unit = {}) = ControllerClient(
         pairing = pairing,
         relay = MqttRelay(brokerConfig, "ctrl-" + pairing.controllerId.toHex().take(8)),
         seq = SeqCounter(InMemorySeqStore(), "seq"),
         scope = scope,
+        log = log,
         ackTimeoutMs = ackTimeoutMs,
         jobTimeoutMs = 20_000,
     ).also { it.start() }
@@ -381,6 +426,92 @@ class RelayIntegrationTest {
         agent.stop()
         withTimeout(10_000) { client.online.first { it == false } }
         client.stop()
+    }
+
+    @Test
+    fun `a job's events can't be opened with the pairing key, nor once the job has ended`() = runBlocking {
+        val pairing = pair("phone")
+        val dropped = CopyOnWriteArrayList<String>()
+        val client = controller(pairing, log = { dropped += it })
+        withTimeout(10_000) { client.online.first { it == true } }
+        assertIs<PressUpdate.Photo>(withTimeout(20_000) { client.press(delayMs = 100).toList() }.last())
+
+        // Someone who recorded the traffic and later steals the pairing key K.
+        val envelope = pairing.envelope()
+        val evtTopic = Topics.evt(deviceHex, pairing.controllerId.toHex())
+        val events = sniffed.filter { it.first == evtTopic }.map { it.second }
+        val jobEvents = events.filter { JobEnvelope.deviceEpk(it) != null }
+        assertTrue(jobEvents.size >= 3, "ack, text and photo go under the job key")
+        val command = sniffed.single { it.first == Topics.cmd(deviceHex, pairing.controllerId.toHex()) && runCatching { Codec.decodeCommand(envelope.open(Direction.CMD, it.second)) is Press }.getOrDefault(false) }
+        val epk = assertIs<Press>(Codec.decodeCommand(envelope.open(Direction.CMD, command.second))).epk
+        assertNotNull(epk, "the controller sends an ephemeral key with every job")
+        for (payload in jobEvents) {
+            assertFailsWith<EnvelopeException> { envelope.open(Direction.EVT, payload) }
+            assertFailsWith<EnvelopeException> { envelope.controllerJob(JobKeyPair.generate(), JobEnvelope.deviceEpk(payload)!!).open(payload) }
+        }
+
+        // Replayed into the next job, the old job's events open nothing. Not from the sniffer: the embedded broker
+        // can stall a client that publishes large messages it is itself subscribed to.
+        dropped.clear()
+        val replayer = MqttRelay(brokerConfig, "replayer")
+        replayer.start()
+        withTimeout(10_000) { replayer.connected.first { it } }
+        val next = async { client.press(delayMs = 1000).toList() }
+        withTimeout(10_000) { while (presses.get() < 2) delay(20) }
+        withTimeout(10_000) { for (payload in jobEvents) replayer.publish(evtTopic, payload) }
+        replayer.stop()
+        val updates = withTimeout(20_000) { next.await() }
+        assertEquals(1, updates.count { it is PressUpdate.Text }, "got $updates")
+        assertIs<PressUpdate.Photo>(updates.last())
+        withTimeout(5_000) { while (dropped.count { it == "dropped unauthenticated event" } < jobEvents.size) delay(20) }
+        client.stop()
+    }
+
+    @Test
+    fun `an older controller without an ephemeral key gets its events under the pairing key`() = runBlocking {
+        val pairing = pair("old phone")
+        val envelope = pairing.envelope()
+        val controllerHex = pairing.controllerId.toHex()
+        val received = CopyOnWriteArrayList<ByteArray>()
+        val old = MqttRelay(brokerConfig, "old-controller")
+        old.subscribe(Topics.evt(deviceHex, controllerHex)) { _, payload -> received += payload }
+        startSubscribed(old)
+        val press: Command = Press(System.currentTimeMillis(), System.currentTimeMillis(), "0123456789abcdef", 100)
+        withTimeout(10_000) { old.publish(Topics.cmd(deviceHex, controllerHex), envelope.seal(Direction.CMD, Codec.encode(press))) }
+        withTimeout(20_000) { while (received.none { runCatching { Codec.decodeEvent(envelope.open(Direction.EVT, it)) is PhotoChunk }.getOrDefault(false) }) delay(50) }
+        assertTrue(received.all { it[0] == 1.toByte() })
+        assertIs<Ack>(Codec.decodeEvent(envelope.open(Direction.EVT, received.first())))
+        old.stop()
+    }
+
+    @Test
+    fun `a controller drops job events under the pairing key, as from an older device or a forger with K`() = runBlocking {
+        // An older device, or someone holding K: same pairing, answers without a job key (ADR 0030).
+        val oldDeviceId = Keys.random(16)
+        val controllerId = Keys.random(16)
+        val key = Keys.random(32)
+        val pairing = PairingCode(deviceId = oldDeviceId, controllerId = controllerId, key = key, broker = brokerConfig)
+        val envelope = pairing.envelope()
+        val oldHex = oldDeviceId.toHex()
+        val oldDevice = MqttRelay(brokerConfig, "old-device")
+        oldDevice.subscribe(Topics.allCmds(oldHex)) { _, payload ->
+            val command = Codec.decodeCommand(envelope.open(Direction.CMD, payload)) as? JobCommand ?: return@subscribe
+            scope.launch {
+                for (event in listOf(Ack(command.job), TextResult(command.job, "654321", true, 0.9f), PhotoChunk(command.job, 0, 1, jpeg.copyOf(1000)))) {
+                    oldDevice.publish(Topics.evt(oldHex, controllerId.toHex()), envelope.seal(Direction.EVT, Codec.encode(event)))
+                }
+            }
+        }
+        startSubscribed(oldDevice)
+        val dropped = CopyOnWriteArrayList<String>()
+        val client = controller(pairing, ackTimeoutMs = 2_000, log = { dropped += it })
+        withTimeout(10_000) { client.connected.first { it } }
+        val updates = withTimeout(20_000) { client.press(delayMs = 100).toList() }
+        assertEquals(listOf(PressUpdate.Sent::class, PressUpdate.Failed::class), updates.map { it::class })
+        assertEquals("timeout", (updates.last() as PressUpdate.Failed).code)
+        withTimeout(5_000) { while (dropped.count { it == "dropped version 1 job event" } < 3) delay(20) }
+        client.stop()
+        oldDevice.stop()
     }
 
     private fun ByteArray.containsSequence(needle: ByteArray): Boolean {

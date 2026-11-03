@@ -19,11 +19,13 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -31,6 +33,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import net.rpb.app.rpb
 import net.rpb.app.ui.Amber
 import net.rpb.app.ui.Bad
 import net.rpb.core.lock.PinCheck
@@ -142,7 +145,11 @@ fun PinSettings(lock: PinLock, onWipe: () -> Unit) {
     }
 
     val newOk = new.isEmpty() || (PinLock.isValid(new) && new == confirm)
+    // Where the Keystore key behind the screen lock lives (ADRs 0028, 0029).
+    val context = LocalContext.current
+    val keyStorage by produceState<String?>(null) { value = withContext(Dispatchers.IO) { context.rpb.store.keyStorage() } }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        keyStorage?.let { Text("Key storage: $it", style = MaterialTheme.typography.bodySmall) }
         Text(
             if (isSet) "The app asks for the PIN on start and after more than a minute away." else "No PIN set.",
             style = MaterialTheme.typography.bodySmall,

@@ -1,6 +1,6 @@
 # 2. A retired Android phone is the remote device
 
-- Status: Accepted
+- Status: Accepted; amended by [0028](0028-keystore-key-bound-to-the-screen-lock.md) (the device phone has a screen lock and needs an unlock after a reboot)
 - Date: 2026-10-15
 
 ## Context

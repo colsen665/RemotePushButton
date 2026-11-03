@@ -1,6 +1,6 @@
 # 15. App PIN lock, with an optional wipe after three wrong PINs
 
-- Status: Accepted; amended by [0020](0020-no-backup-transfer-or-screen-capture.md) (`FLAG_SECURE` covers the Recents thumbnail) [0024](0024-relay-hardening-and-release-builds.md) (lockouts on the time since boot; release builds keep `run-as` out) and [0026](0026-history-in-memory-expiring.md) (locking clears the controller history)
+- Status: Accepted; amended by [0020](0020-no-backup-transfer-or-screen-capture.md) (`FLAG_SECURE` covers the Recents thumbnail) [0024](0024-relay-hardening-and-release-builds.md) (lockouts on the time since boot; release builds keep `run-as` out) and [0026](0026-history-in-memory-expiring.md) (locking clears the controller history) and [0028](0028-keystore-key-bound-to-the-screen-lock.md) (the screen lock, not the app PIN, protects the keys at rest)
 - Date: 2026-10-16
 - Refines: [0006](0006-e2e-crypto-and-qr-pairing.md) (keys at rest), [0009](0009-device-app-as-home-launcher.md) (device phone UI)
 

@@ -13,10 +13,27 @@ sealed interface Command {
     val ts: Long
 }
 
+/**
+ * A command that starts a job. [epk], if present, is the controller's ephemeral X25519 public key for the job: the
+ * device answers the job's events under a key derived from it (ADR 0030). Older controllers leave it out and get
+ * their events under the pairing key.
+ */
+@Serializable
+sealed interface JobCommand : Command {
+    val job: String
+    val epk: ByteArray?
+}
+
 /** [delayMs] is 1000 when absent: older controllers leave out their fixed 1 s, which equals this default (ADR 0019). */
 @Serializable
 @SerialName("press")
-data class Press(override val seq: Long, override val ts: Long, val job: String, val delayMs: Int = 1000) : Command
+data class Press(
+    override val seq: Long,
+    override val ts: Long,
+    override val job: String,
+    val delayMs: Int = 1000,
+    @ByteString override val epk: ByteArray? = null,
+) : JobCommand
 
 @Serializable
 @SerialName("status?")
@@ -28,7 +45,13 @@ data class StatusRequest(override val seq: Long, override val ts: Long) : Comman
  */
 @Serializable
 @SerialName("calib_photo")
-data class CalibPhoto(override val seq: Long, override val ts: Long, val job: String, val pressDelayMs: Int? = null) : Command
+data class CalibPhoto(
+    override val seq: Long,
+    override val ts: Long,
+    override val job: String,
+    val pressDelayMs: Int? = null,
+    @ByteString override val epk: ByteArray? = null,
+) : JobCommand
 
 /** Save a calibration made on the controller, then take a photo and read it with it, as `calib_photo` does (ADR 0016). */
 @Serializable
@@ -36,10 +59,11 @@ data class CalibPhoto(override val seq: Long, override val ts: Long, val job: St
 data class SetCalibration(
     override val seq: Long,
     override val ts: Long,
-    val job: String,
+    override val job: String,
     val calibration: Calibration,
     val pressDelayMs: Int? = null,
-) : Command
+    @ByteString override val epk: ByteArray? = null,
+) : JobCommand
 
 /** Device → controller. */
 @Serializable

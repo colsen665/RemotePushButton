@@ -41,6 +41,8 @@ data class ControllerUi(
     val text: TextResult? = null,
     val photo: ByteArray? = null,
     val error: String? = null,
+    /** Why the last scanned pairing QR wasn't added. */
+    val scanError: String? = null,
     val history: List<HistoryEntry> = emptyList(),
 )
 
@@ -55,12 +57,30 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
     private var expiry: Job? = null
     private var started = false
 
+    /** The selected device's pairing code, so the selection survives the store closing and opening (ADR 0028). */
+    private var selectedCode: String? = null
+
     /** When the code or photo on screen arrived; it expires like the history (ADR 0026). */
     private var resultAt: Long? = null
 
     init {
         viewModelScope.launch { history.entries.collect { v -> _ui.update { it.copy(history = v) } } }
         viewModelScope.launch { app.rpb.locks.collect { clearResult() } }
+        // Empty while the store is closed (ADR 0028): drop the client, which holds the pairing key.
+        viewModelScope.launch {
+            store.pairings.collect { pairings ->
+                if (pairings.isEmpty()) {
+                    _ui.update { it.copy(pairings = pairings) }
+                    disconnect()
+                } else {
+                    val index = pairings.indexOfFirst { it.code == selectedCode }.takeIf { it >= 0 }
+                        ?: _ui.value.selected.coerceIn(0, pairings.size - 1)
+                    selectedCode = pairings[index].code
+                    _ui.update { it.copy(pairings = pairings, selected = index) }
+                    if (started && client == null) connect()
+                }
+            }
+        }
     }
 
     /** Connect only while the screen is visible — no background work on the user's phone. */
@@ -93,28 +113,38 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun select(index: Int) {
+        selectedCode = _ui.value.pairings.getOrNull(index)?.code
         resultAt = null
         _ui.update { it.copy(selected = index, text = null, photo = null, error = null, progress = "") }
         if (started) connect()
     }
 
-    /** Returns an error message, or null if the code was accepted. */
-    fun addPairing(text: String): String? {
-        val code = runCatching { PairingCode.decode(text.trim()) }.getOrElse { return "Not a valid pairing code" }
+    /** A scanned pairing QR; [ControllerUi.scanError] says why it wasn't added. */
+    fun addPairing(text: String) {
+        val scanned = text.trim()
+        val code = runCatching { PairingCode.decode(scanned) }.getOrElse {
+            _ui.update { it.copy(scanError = "Not a valid pairing code") }
+            return
+        }
         // Scanning a device again keeps the delay set for it.
-        val old = store.pairings.value.firstOrNull { it.code == text.trim() }
-        store.addPairing(StoredPairing(text.trim(), code.deviceName.ifBlank { "Device" }, old?.delayMs ?: ControllerClient.DEFAULT_DELAY_MS))
+        val old = store.pairings.value.firstOrNull { it.code == scanned }
+        // The store closes when the app is left during the scan (ADR 0028), and the result can arrive before it reopens.
+        if (!store.addPairing(StoredPairing(scanned, code.deviceName.ifBlank { "Device" }, old?.delayMs ?: ControllerClient.DEFAULT_DELAY_MS))) {
+            _ui.update { it.copy(scanError = "The app locked during the scan. Unlock it and scan again.") }
+            return
+        }
         val pairings = store.pairings.value
-        _ui.update { it.copy(pairings = pairings) }
-        select(pairings.indexOfFirst { it.code == text.trim() })
-        return null
+        _ui.update { it.copy(pairings = pairings, scanError = null) }
+        select(pairings.indexOfFirst { it.code == scanned })
     }
 
     fun removeSelected() {
         val pairing = _ui.value.pairings.getOrNull(_ui.value.selected) ?: return
         disconnect()
-        store.removePairing(pairing.code)
-        _ui.update { it.copy(pairings = store.pairings.value, selected = 0, online = null, status = null) }
+        selectedCode = null
+        if (store.removePairing(pairing.code)) {
+            _ui.update { it.copy(pairings = store.pairings.value, selected = 0, online = null, status = null) }
+        }
         if (started) connect()
     }
 
@@ -125,8 +155,7 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
     /** Sets how long the selected device waits between the press and the photo (ADR 0019). */
     fun setDelay(delayMs: Int) {
         val pairing = _ui.value.pairings.getOrNull(_ui.value.selected) ?: return
-        store.updatePairing(pairing.copy(delayMs = delayMs))
-        _ui.update { it.copy(pairings = store.pairings.value) }
+        if (store.updatePairing(pairing.copy(delayMs = delayMs))) _ui.update { it.copy(pairings = store.pairings.value) }
     }
 
     fun calibrationPhoto() = run(isCalibration = true) { it.calibrationPhoto() }

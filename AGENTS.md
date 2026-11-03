@@ -26,8 +26,8 @@ Protocol: [`docs/protocol.md`](docs/protocol.md). Threat model: [`docs/security.
 ## Repo layout
 ```
 android/                Gradle root (Kotlin 2.0, AGP 8.7, compileSdk 35, minSdk 26)
-  core/                 pure Kotlin/JVM — crypto/, protocol/, relay/, ocr/, lock/PinLock, device/DeviceAgent, controller/ControllerClient
-  app/                  Android app — device/ (service, BLE, camera, pairing, calibration), controller/ (UI), common/ (storage, PIN lock UI)
+  core/                 pure Kotlin/JVM — crypto/, protocol/, relay/, ocr/, lock/PinLock, vault/SecretVault, device/DeviceAgent, controller/ControllerClient
+  app/                  Android app — device/ (service, BLE, camera, pairing, calibration), controller/ (UI), common/ (storage, Keystore, PIN lock UI)
 docs/                   protocol.md, security.md, setup.md, adr/
 hardware/mount/         (planned) printable stand / Bot bracket, see README there
 ```
@@ -46,9 +46,9 @@ A debug build can't update a release install or the other way round: `adb uninst
 
 Check for an attached phone with `adb devices`.
 
-`RelayIntegrationTest` is flaky: in about one run in three, one of its tests times out. Rerun it before suspecting a change (tracked in `TODO.md`).
+`RelayIntegrationTest` runs against an embedded Moquette broker. A test waits until the broker has stored the device's `online` flag, because Moquette can lose a retained message for a client that subscribes while it is being published. A raw `MqttRelay` in a test waits for `onConnected`, not `connected`, before anyone publishes to it.
 
-CI (`.github/workflows/ci.yml`) runs `:core:test` and `:app:assembleDebug` on pushes to `master` and on pull requests. `.github/scripts/core-test.sh` retries `RelayIntegrationTest` up to twice; a failure in any other test fails the build at once.
+CI (`.github/workflows/ci.yml`) runs `:core:test` and `:app:assembleDebug` on pushes to `master` and on pull requests. `.github/scripts/core-test.sh` runs `:core:test` with no retries, so any failing test fails the build.
 
 ### Reader test scenes
 The reader, locator and anchor tests run on `Scenes` in `core/src/test/.../SyntheticPhoto.kt`: drawn displays with invented codes (ADR 0027). **Never commit a real photo of the display or a code it has shown**, in a file, a filename, a test, a doc or a commit message. To reproduce a failed read, add a scene with an invented code that shows the same problem (fade, glare, tilt, blur). The locator is sensitive to small changes in a scene (tracked in `TODO.md`), so a new scene may need a nudge before it is found.

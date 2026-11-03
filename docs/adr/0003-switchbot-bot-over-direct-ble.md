@@ -1,6 +1,6 @@
 # 3. SwitchBot Bot, controlled directly over BLE, presses the button
 
-- Status: Accepted
+- Status: Accepted; amended by [0025](0025-optional-switchbot-bot-password.md) (command bytes with a password), [0031](0031-scan-for-the-bot-before-connecting.md) (a scan for the Bot's address before the first connect and after a failure)
 - Date: 2026-10-15
 
 ## Context

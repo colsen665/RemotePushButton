@@ -9,7 +9,10 @@ import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import net.rpb.core.crypto.Direction
+import net.rpb.core.crypto.Envelope
 import net.rpb.core.crypto.EnvelopeException
+import net.rpb.core.crypto.JobEnvelope
+import net.rpb.core.crypto.JobKeyPair
 import net.rpb.core.crypto.Keys
 import net.rpb.core.crypto.PairingCode
 import net.rpb.core.crypto.toHex
@@ -60,7 +63,7 @@ class ControllerClient(
     private val deviceHex = pairing.deviceId.toHex()
     private val controllerHex = pairing.controllerId.toHex()
     private val envelope = pairing.envelope()
-    private val jobs = ConcurrentHashMap<String, Channel<Event>>()
+    private val jobs = ConcurrentHashMap<String, OpenJob>()
     private val assembler = ChunkAssembler()
 
     private val _online = MutableStateFlow<Boolean?>(null)
@@ -85,27 +88,30 @@ class ControllerClient(
         runCatching { publish(StatusRequest(seq.next(), clock())) }.onFailure { log("status request failed: $it") }
     }
 
-    fun press(delayMs: Int = DEFAULT_DELAY_MS): Flow<PressUpdate> = runJob { job -> Press(seq.next(), clock(), job, delayMs) }
+    fun press(delayMs: Int = DEFAULT_DELAY_MS): Flow<PressUpdate> =
+        runJob { job, epk -> Press(seq.next(), clock(), job, delayMs, epk) }
 
     /** A photo to calibrate on; with [pressDelayMs], the device presses first and waits that long (ADR 0021). */
     fun calibrationPhoto(pressDelayMs: Int? = null): Flow<PressUpdate> =
-        runJob { job -> CalibPhoto(seq.next(), clock(), job, pressDelayMs) }
+        runJob { job, epk -> CalibPhoto(seq.next(), clock(), job, pressDelayMs, epk) }
 
     /** Saves [calibration] on the device, which then answers like [calibrationPhoto] with the new calibration. */
     fun setCalibration(calibration: Calibration, pressDelayMs: Int? = null): Flow<PressUpdate> =
-        runJob { job -> SetCalibration(seq.next(), clock(), job, calibration, pressDelayMs) }
+        runJob { job, epk -> SetCalibration(seq.next(), clock(), job, calibration, pressDelayMs, epk) }
 
-    private fun runJob(command: (String) -> Command): Flow<PressUpdate> = channelFlow {
+    private fun runJob(command: (job: String, epk: ByteArray) -> Command): Flow<PressUpdate> = channelFlow {
         val job = Keys.random(8).toHex()
-        val events = Channel<Event>(Channel.UNLIMITED)
-        jobs[job] = events
+        val keys = JobKeyPair.generate()
+        val open = OpenJob(job, keys)
+        jobs[job] = open
         try {
-            publish(command(job))
+            publish(command(job, keys.public))
             send(PressUpdate.Sent(job))
-            val finished = withTimeoutOrNull(jobTimeoutMs) { followJob(job, events) { send(it) } }
+            val finished = withTimeoutOrNull(jobTimeoutMs) { followJob(job, open.events) { send(it) } }
             if (finished == null) send(PressUpdate.Failed("timeout", "no complete reply from device"))
         } finally {
             jobs.remove(job)
+            open.close()
             assembler.discard(job)
         }
     }
@@ -142,6 +148,9 @@ class ControllerClient(
     }
 
     private fun onEvent(payload: ByteArray) {
+        JobEnvelope.deviceEpk(payload)?.let { return onJobEvent(payload, it) }
+        // Version 1 carries only status: every job's events come under its job key, so a version 1 job event can
+        // only be a forgery by someone holding K, or a device older than ADR 0030, which none is (ADR 0030).
         val event = try {
             Codec.decodeEvent(envelope.open(Direction.EVT, payload))
         } catch (e: EnvelopeException) {
@@ -151,16 +160,74 @@ class ControllerClient(
             log("dropped malformed event: $e")
             return
         }
-        val job = when (event) {
-            is Ack -> event.job
-            is Busy -> event.job
-            is CalibrationState -> event.job
-            is TextResult -> event.job
-            is PhotoChunk -> event.job
-            is ErrorEvent -> event.job
-            is Status -> { _status.value = event; null }
+        if (event is Status) _status.value = event else log("dropped version 1 job event")
+    }
+
+    /** The job whose key opens [payload] is the one it belongs to; its ID isn't on the wire. */
+    private fun onJobEvent(payload: ByteArray, deviceEpk: ByteArray) {
+        for (open in jobs.values) {
+            val plain = open.open(envelope, payload, deviceEpk) ?: continue
+            val event = try {
+                Codec.decodeEvent(plain)
+            } catch (e: Exception) {
+                log("dropped malformed event: $e")
+                return
+            }
+            if (jobOf(event) == open.job) open.events.trySend(event) else log("dropped event naming another job")
+            return
         }
-        if (job != null) jobs[job]?.trySend(event)
+        log("dropped unauthenticated event")
+    }
+
+    private fun jobOf(event: Event): String? = when (event) {
+        is Ack -> event.job
+        is Busy -> event.job
+        is CalibrationState -> event.job
+        is TextResult -> event.job
+        is PhotoChunk -> event.job
+        is ErrorEvent -> event.job
+        is Status -> null
+    }
+
+    /**
+     * A job in progress. Its ephemeral private key lives until the device's first event names the device's key,
+     * then only the derived job envelope remains, until the job ends (ADR 0030).
+     */
+    private class OpenJob(val job: String, keys: JobKeyPair) {
+        val events = Channel<Event>(Channel.UNLIMITED)
+        private var keys: JobKeyPair? = keys
+        private var jobEnvelope: JobEnvelope? = null
+
+        /** [payload] opened, or null if it isn't this job's. */
+        @Synchronized
+        fun open(pairEnvelope: Envelope, payload: ByteArray, deviceEpk: ByteArray): ByteArray? {
+            jobEnvelope?.let { known ->
+                if (!known.deviceEpk.contentEquals(deviceEpk)) return null
+                return try {
+                    known.open(payload)
+                } catch (e: EnvelopeException) {
+                    null
+                }
+            }
+            val pair = keys ?: return null
+            return try {
+                val candidate = pairEnvelope.controllerJob(pair, deviceEpk)
+                candidate.open(payload).also {
+                    jobEnvelope = candidate
+                    pair.destroy()
+                    keys = null
+                }
+            } catch (e: EnvelopeException) {
+                null
+            }
+        }
+
+        @Synchronized
+        fun close() {
+            keys?.destroy()
+            keys = null
+            jobEnvelope = null
+        }
     }
 
     companion object {
