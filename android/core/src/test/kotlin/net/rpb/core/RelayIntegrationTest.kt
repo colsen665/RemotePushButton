@@ -87,7 +87,9 @@ class RelayIntegrationTest {
     private val registry = ConcurrentHashMap<String, PairedController>()
     private val presses = AtomicInteger()
     private val hardware = CopyOnWriteArrayList<String>()
-    private var pressDurationMs = 50L
+    /** If set, the press lasts until it completes. */
+    @Volatile
+    private var pressGate: CompletableDeferred<Unit>? = null
     @Volatile
     private var statusFails = false
 
@@ -137,7 +139,7 @@ class RelayIntegrationTest {
             replay = ReplayGuard(InMemorySeqStore()),
             presser = {
                 hardware += "press"
-                delay(pressDurationMs)
+                pressGate?.await() ?: delay(50)
                 presses.incrementAndGet()
             },
             camera = object : FrameSource {
@@ -281,7 +283,10 @@ class RelayIntegrationTest {
         assertEquals(300, agent.delayMs)
 
         hardware.clear()
-        agent.calibrationFrame(press = true)
+        // The controller can have the whole photo before the device's job has let go of the button.
+        withTimeout(5_000) {
+            while (runCatching { agent.calibrationFrame(press = true) }.isFailure) delay(20)
+        }
         assertEquals(listOf("prepare", "press", "capture"), hardware)
         agent.calibrationFrame(press = false)
         assertEquals(2, presses.get())
@@ -375,15 +380,16 @@ class RelayIntegrationTest {
 
     @Test
     fun `second press while busy is rejected`() = runBlocking {
-        pressDurationMs = 1500
+        val gate = CompletableDeferred<Unit>().also { pressGate = it }
         val a = controller(pair("a"))
         val b = controller(pair("b"))
         withTimeout(10_000) { a.online.first { it == true } }
-        withTimeout(10_000) { b.connected.first { it } }
+        withTimeout(10_000) { b.online.first { it == true } }
 
         val first = async { a.press(delayMs = 100).toList() }
-        delay(500)
+        withTimeout(10_000) { while ("press" !in hardware) delay(20) }
         val second = withTimeout(10_000) { b.press(delayMs = 100).toList() }
+        gate.complete(Unit)
         assertTrue(second.contains(PressUpdate.DeviceBusy), "got $second")
         assertIs<PressUpdate.Photo>(withTimeout(20_000) { first.await() }.last())
         assertEquals(1, presses.get())

@@ -7,6 +7,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import net.rpb.core.crypto.Direction
 import net.rpb.core.crypto.Envelope
@@ -64,6 +66,7 @@ class ControllerClient(
     private val controllerHex = pairing.controllerId.toHex()
     private val envelope = pairing.envelope()
     private val jobs = ConcurrentHashMap<String, OpenJob>()
+    private val sending = Mutex()
     private val assembler = ChunkAssembler()
 
     private val _online = MutableStateFlow<Boolean?>(null)
@@ -76,8 +79,10 @@ class ControllerClient(
     val connected: StateFlow<Boolean> get() = relay.connected
 
     fun start() {
-        relay.subscribe(Topics.online(deviceHex)) { _, payload -> _online.value = payload.contentEquals("1".toByteArray()) }
+        // Events first: the retained online flag arrives once its own subscription is active, and a press sent on
+        // seeing it must not have its reply arrive before the events subscription is.
         relay.subscribe(Topics.evt(deviceHex, controllerHex)) { _, payload -> onEvent(payload) }
+        relay.subscribe(Topics.online(deviceHex)) { _, payload -> _online.value = payload.contentEquals("1".toByteArray()) }
         relay.onConnected { scope.launch { requestStatus() } }
         relay.start()
     }
@@ -85,7 +90,7 @@ class ControllerClient(
     fun stop() = relay.stop()
 
     suspend fun requestStatus() {
-        runCatching { publish(StatusRequest(seq.next(), clock())) }.onFailure { log("status request failed: $it") }
+        runCatching { publish { StatusRequest(seq.next(), clock()) } }.onFailure { log("status request failed: $it") }
     }
 
     fun press(delayMs: Int = DEFAULT_DELAY_MS): Flow<PressUpdate> =
@@ -105,7 +110,7 @@ class ControllerClient(
         val open = OpenJob(job, keys)
         jobs[job] = open
         try {
-            publish(command(job, keys.public))
+            publish { command(job, keys.public) }
             send(PressUpdate.Sent(job))
             val finished = withTimeoutOrNull(jobTimeoutMs) { followJob(job, open.events) { send(it) } }
             if (finished == null) send(PressUpdate.Failed("timeout", "no complete reply from device"))
@@ -143,8 +148,12 @@ class ControllerClient(
         }
     }
 
-    private suspend fun publish(command: Command) {
-        relay.publish(Topics.cmd(deviceHex, controllerHex), envelope.seal(Direction.CMD, Codec.encode(command)))
+    /**
+     * Numbers and sends a command in one step. The device drops a command numbered below one it already has, so the
+     * status request sent on connecting must not overtake a press numbered before it.
+     */
+    private suspend fun publish(command: () -> Command) = sending.withLock {
+        relay.publish(Topics.cmd(deviceHex, controllerHex), envelope.seal(Direction.CMD, Codec.encode(command())))
     }
 
     private fun onEvent(payload: ByteArray) {

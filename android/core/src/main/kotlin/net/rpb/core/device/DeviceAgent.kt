@@ -3,6 +3,7 @@ package net.rpb.core.device
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -127,19 +128,18 @@ class DeviceAgent(
     var delayMs: Int = ControllerClient.DEFAULT_DELAY_MS
         private set
 
+    private val commands = Channel<Pair<String, ByteArray>>(Channel.UNLIMITED)
+
     fun start() {
-        relay.subscribe(Topics.allCmds(deviceHex)) { topic, payload ->
-            scope.launch {
-                // Uncaught, one failing command (an OS permission, a lost connection) takes the whole service down.
-                try {
-                    handle(topic, payload)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    log("command failed: $e")
-                }
+        // Commands are admitted one at a time in the order they arrive, so the replay guard sees each controller's
+        // numbers in order; each then runs on its own, so a press during a job is answered busy.
+        scope.launch {
+            for ((topic, payload) in commands) {
+                val run = guarded { admit(topic, payload) } ?: continue
+                scope.launch { guarded { run() } }
             }
         }
+        relay.subscribe(Topics.allCmds(deviceHex)) { topic, payload -> commands.trySend(topic to payload) }
         relay.onConnected {
             scope.launch { runCatching { relay.publish(Topics.online(deviceHex), ONLINE, retain = true) } }
         }
@@ -152,25 +152,36 @@ class DeviceAgent(
         relay.stop()
     }
 
-    private suspend fun handle(topic: String, payload: ByteArray) {
-        val controllerHex = Topics.controllerOfCmd(deviceHex, topic) ?: return
+    /** Uncaught, one failing command (an OS permission, a lost connection) takes the whole service down. */
+    private inline fun <T> guarded(block: () -> T): T? = try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        log("command failed: $e")
+        null
+    }
+
+    /** Authenticates [payload] and checks it isn't replayed; returns what carries it out, or null if it is dropped. */
+    private fun admit(topic: String, payload: ByteArray): (suspend () -> Unit)? {
+        val controllerHex = Topics.controllerOfCmd(deviceHex, topic) ?: return null
         val controller = registry.find(controllerHex) ?: run {
             log("ignored command from unknown controller $controllerHex")
-            return
+            return null
         }
         val envelope = Envelope.forPair(controller.key, deviceId, controllerHex.hexToBytes())
         val command = try {
             Codec.decodeCommand(envelope.open(Direction.CMD, payload))
         } catch (e: EnvelopeException) {
             log("dropped unauthenticated command for ${controller.name}")
-            return
+            return null
         } catch (e: Exception) {
             log("dropped malformed command for ${controller.name}: $e")
-            return
+            return null
         }
         if (!replay.accept(controllerHex, command)) {
             log("dropped replayed/stale command from ${controller.name}")
-            return
+            return null
         }
         // A job's events go under a key that is gone once the job ends (ADR 0030); older controllers send no epk.
         val epk = (command as? JobCommand)?.epk
@@ -181,35 +192,37 @@ class DeviceAgent(
                 envelope.deviceJob(epk)
             } catch (e: EnvelopeException) {
                 log("dropped command with a bad job key from ${controller.name}")
-                return
+                return null
             }
             jobEnvelope::seal
         }
         val reply: suspend (Event) -> Unit = { event ->
             relay.publish(Topics.evt(deviceHex, controllerHex), seal(Codec.encode(event)))
         }
-        when (command) {
-            is Press -> {
-                delayMs = command.delayMs
-                runJob(controller, command.job, command.delayMs, press = true, reply)
-            }
-            is CalibPhoto -> {
-                command.pressDelayMs?.let { delayMs = it }
-                runJob(controller, command.job, command.pressDelayMs ?: 0, press = command.pressDelayMs != null, reply, calibrating = true)
-            }
-            is SetCalibration -> {
-                val problem = command.calibration.problem()
-                command.pressDelayMs?.let { delayMs = it }
-                if (problem != null) {
-                    reply(ErrorEvent(command.job, ErrorCodes.BAD_CALIBRATION, problem))
-                } else {
-                    runJob(
-                        controller, command.job, command.pressDelayMs ?: 0, press = command.pressDelayMs != null, reply,
-                        calibrating = true, save = command.calibration,
-                    )
+        return {
+            when (command) {
+                is Press -> {
+                    delayMs = command.delayMs
+                    runJob(controller, command.job, command.delayMs, press = true, reply)
                 }
+                is CalibPhoto -> {
+                    command.pressDelayMs?.let { delayMs = it }
+                    runJob(controller, command.job, command.pressDelayMs ?: 0, press = command.pressDelayMs != null, reply, calibrating = true)
+                }
+                is SetCalibration -> {
+                    val problem = command.calibration.problem()
+                    command.pressDelayMs?.let { delayMs = it }
+                    if (problem != null) {
+                        reply(ErrorEvent(command.job, ErrorCodes.BAD_CALIBRATION, problem))
+                    } else {
+                        runJob(
+                            controller, command.job, command.pressDelayMs ?: 0, press = command.pressDelayMs != null, reply,
+                            calibrating = true, save = command.calibration,
+                        )
+                    }
+                }
+                is StatusRequest -> reply(statusSource.status())
             }
-            is StatusRequest -> reply(statusSource.status())
         }
     }
 

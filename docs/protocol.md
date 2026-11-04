@@ -74,7 +74,7 @@ The plaintext is CBOR. Message types are a sealed hierarchy encoded by kotlinx-s
 - |device clock − `ts`| must be at most 120 s.
 - A command failing either rule is dropped.
 
-Controllers use `seq = max(lastSeq + 1, now in ms)`. `job` is 8 random bytes in hex.
+Controllers use `seq = max(lastSeq + 1, now in ms)`, and number and send one command at a time, so the commands of one controller reach the relay in `seq` order. The device checks commands against these rules in the order they arrive. `job` is 8 random bytes in hex.
 
 ### Events (device → controller)
 Events of a job travel in a job envelope; `status` in a version 1 envelope, the only version 1 event a controller accepts (ADR 0030).
