@@ -13,6 +13,7 @@ import net.rpb.core.crypto.BrokerConfig
 import net.rpb.core.controller.ControllerClient
 import net.rpb.core.crypto.Keys
 import net.rpb.core.crypto.toHex
+import net.rpb.core.device.PairedController
 import net.rpb.core.lock.PinLock
 import net.rpb.core.lock.PinState
 import net.rpb.core.ocr.DisplayAnchor
@@ -59,8 +60,30 @@ data class DeviceSettings(
     }
 }
 
+/** A controller paired with this device; [publicKey] (Base64 SPKI) and [bindUntil] as in [PairedController] (ADR 0033). */
 @Serializable
-data class StoredController(val id: String, val name: String, val key: String, val createdAt: Long)
+data class StoredController(
+    val id: String,
+    val name: String,
+    val key: String,
+    val createdAt: Long,
+    val publicKey: String? = null,
+    val bindUntil: Long? = null,
+) {
+    fun paired() = PairedController(
+        id,
+        name,
+        Base64.decode(key, Base64.NO_WRAP),
+        publicKey?.let { Base64.decode(it, Base64.NO_WRAP) },
+        bindUntil,
+    )
+
+    companion object {
+        /** A new controller, pending until [now] + [PairedController.BIND_WINDOW_MS]: its QR is shown from [now]. */
+        fun pending(id: String, name: String, key: ByteArray, now: Long) =
+            StoredController(id, name, Base64.encodeToString(key, Base64.NO_WRAP), now, bindUntil = now + PairedController.BIND_WINDOW_MS)
+    }
+}
 
 @Serializable
 data class StoredPairing(
@@ -68,6 +91,8 @@ data class StoredPairing(
     val name: String,
     /** Wait between the press and the photo on this device (ADR 0019). */
     val delayMs: Int = ControllerClient.DEFAULT_DELAY_MS,
+    /** The device bound this phone's signing key for the pairing (ADR 0033); false for pairings made before. */
+    val bound: Boolean = false,
 )
 
 @Serializable
@@ -146,9 +171,39 @@ class Store(context: Context) {
     /** Opens the secrets ([SecretVault.open]): Keystore work, so off the main thread. */
     @Synchronized
     fun open(): Vault {
+        val reopened = secrets.state.value != Vault.OPEN
         val state = secrets.open()
         secrets.value?.let(::publish)
+        if (reopened && state == Vault.OPEN) {
+            dropPendingControllers()
+            if (_mode.value == Mode.CONTROLLER) dropUnpairedSigningKeys()
+        }
         return state
+    }
+
+    /**
+     * Removes every pending controller, those past their deadline among them (ADR 0033). Run as the secrets open:
+     * the QR dialog shows only while they are open, so no pending controller's QR can be on screen yet.
+     */
+    private fun dropPendingControllers() {
+        val pending = secrets.value?.controllers.orEmpty().filter { it.paired().pending }.map { it.id }.toSet()
+        if (pending.isEmpty()) return
+        update { s -> s.copy(controllers = s.controllers.filterNot { it.id in pending }) }
+        Log.i("RPB", "removed ${pending.size} controller(s) never bound")
+    }
+
+    /**
+     * Deletes the signing keys with no stored pairing (ADR 0033), left by an add cut short before its pairing was
+     * saved, except one being bound now. Under the store's lock, so no pairing is saved meanwhile.
+     */
+    private fun dropUnpairedSigningKeys() {
+        val pairings = secrets.value?.pairings ?: return
+        // A bound pairing this app can't read (a later version's code) still has its key: delete nothing then.
+        if (pairings.any { it.bound && SigningKeys.alias(it.code) == null }) return
+        val paired = pairings.mapNotNull { SigningKeys.alias(it.code) }.toSet()
+        runCatching { SigningKeys.deleteUnpaired(paired) }
+            .onSuccess { if (it > 0) Log.i("RPB", "removed $it signing key(s) with no pairing") }
+            .onFailure { Log.w("RPB", "signing keys not checked: ${it.javaClass.simpleName}") }
     }
 
     /** [KeystoreBox.describe] as logged when the secrets first opened in this process. */
@@ -178,6 +233,24 @@ class Store(context: Context) {
     @Synchronized
     fun removeController(id: String) = update { s -> s.copy(controllers = s.controllers.filterNot { it.id == id }) }
 
+    // These two check and save under the store's lock, so a bind and the QR dialog closing can't both win (ADR 0033).
+
+    /** Binds [publicKey] to controller [id] if it [PairedController.canBind] at [now]; false if it is gone, not pending, or late. */
+    @Synchronized
+    fun bindController(id: String, publicKey: ByteArray, now: Long): Boolean {
+        val controller = secrets.value?.controllers?.firstOrNull { it.id == id } ?: return false
+        if (!controller.paired().canBind(now)) return false
+        val bound = controller.copy(publicKey = Base64.encodeToString(publicKey, Base64.NO_WRAP), bindUntil = null)
+        return update { s -> s.copy(controllers = s.controllers.map { if (it.id == id) bound else it }) }
+    }
+
+    /** Removes controller [id] only if it is still pending; true if it was removed. */
+    @Synchronized
+    fun removePendingController(id: String): Boolean {
+        val controller = secrets.value?.controllers?.firstOrNull { it.id == id } ?: return false
+        return controller.paired().pending && removeController(id)
+    }
+
     @Synchronized
     fun addPairing(pairing: StoredPairing) = update { s -> s.copy(pairings = s.pairings.filterNot { it.code == pairing.code } + pairing) }
 
@@ -201,8 +274,9 @@ class Store(context: Context) {
     }
 
     /**
-     * Erases all app data (ADR 0015): secrets, preferences, controller history and the Keystore key, so nothing
-     * left behind can be decrypted. The process must restart afterwards; in-memory state is not reset.
+     * Erases all app data (ADR 0015): secrets, preferences, controller history and the Keystore keys, the pairings'
+     * signing keys and the device's among them (ADR 0033), so nothing left behind can be decrypted or sign. The
+     * process must restart afterwards; in-memory state is not reset.
      */
     @SuppressLint("ApplySharedPref") // must reach the disk before the process exits
     @Synchronized
@@ -211,6 +285,8 @@ class Store(context: Context) {
         appContext.filesDir.listFiles()?.forEach { it.deleteRecursively() }
         appContext.cacheDir.listFiles()?.forEach { it.deleteRecursively() }
         keystore.deleteKeys()
+        SigningKeys.deleteAll()
+        DeviceKey.delete()
     }
 
     private companion object {

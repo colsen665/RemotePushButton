@@ -17,10 +17,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import net.rpb.core.controller.BindResult
 import net.rpb.core.controller.ControllerClient
 import net.rpb.core.controller.PressUpdate
 import net.rpb.core.crypto.BrokerConfig
-import net.rpb.core.crypto.Direction
+import net.rpb.core.crypto.CommandSignature
 import net.rpb.core.crypto.EnvelopeException
 import net.rpb.core.crypto.JobEnvelope
 import net.rpb.core.crypto.JobKeyPair
@@ -28,10 +29,10 @@ import net.rpb.core.crypto.Keys
 import net.rpb.core.crypto.PairingCode
 import net.rpb.core.crypto.toHex
 import net.rpb.core.device.CalibrationStore
-import net.rpb.core.device.ControllerRegistry
 import net.rpb.core.device.DeviceAgent
 import net.rpb.core.device.Frame
 import net.rpb.core.device.FrameSource
+import net.rpb.core.device.InMemoryControllerRegistry
 import net.rpb.core.device.PairedController
 import net.rpb.core.device.RowCutter
 import net.rpb.core.ocr.Calibration
@@ -41,6 +42,8 @@ import net.rpb.core.ocr.Move
 import net.rpb.core.ocr.Point
 import net.rpb.core.ocr.RowCrop
 import net.rpb.core.protocol.Ack
+import net.rpb.core.protocol.Bind
+import net.rpb.core.protocol.Bound
 import net.rpb.core.protocol.Codec
 import net.rpb.core.protocol.Command
 import net.rpb.core.protocol.InMemorySeqStore
@@ -51,6 +54,7 @@ import net.rpb.core.protocol.TextResult
 import net.rpb.core.protocol.ReplayGuard
 import net.rpb.core.protocol.SeqCounter
 import net.rpb.core.protocol.Status
+import net.rpb.core.protocol.StatusRequest
 import net.rpb.core.relay.MqttRelay
 import net.rpb.core.relay.Topics
 import net.rpb.core.relay.Will
@@ -84,7 +88,10 @@ class RelayIntegrationTest {
 
     private val deviceId = Keys.random(16)
     private val deviceHex = deviceId.toHex()
-    private val registry = ConcurrentHashMap<String, PairedController>()
+    private val registry = InMemoryControllerRegistry()
+    private val deviceLog = CopyOnWriteArrayList<String>()
+    private val signers = ConcurrentHashMap<String, SoftwareSigner>()
+    private val deviceSigner = SoftwareSigner()
     private val presses = AtomicInteger()
     private val hardware = CopyOnWriteArrayList<String>()
     /** If set, the press lasts until it completes. */
@@ -134,8 +141,9 @@ class RelayIntegrationTest {
         val deviceRelay = MqttRelay(brokerConfig, "device", Will(Topics.online(deviceHex), "0".toByteArray()))
         agent = DeviceAgent(
             deviceId = deviceId,
+            signer = deviceSigner,
             relay = deviceRelay,
-            registry = ControllerRegistry { registry[it] },
+            registry = registry,
             replay = ReplayGuard(InMemorySeqStore()),
             presser = {
                 hardware += "press"
@@ -171,6 +179,7 @@ class RelayIntegrationTest {
                 Status(System.currentTimeMillis(), 77, 30.5f, true, 90, -55)
             },
             scope = scope,
+            log = { deviceLog += it },
         )
         agent.start()
         assertTrue(deviceOnline.await(10, TimeUnit.SECONDS), "the device never raised its online flag")
@@ -208,26 +217,72 @@ class RelayIntegrationTest {
         broker.stopServer()
     }
 
+    /** A new pairing, pending while its QR is shown (ADR 0033). */
     private fun pair(name: String): PairingCode {
         val controllerId = Keys.random(16)
         val key = Keys.random(32)
-        registry[controllerId.toHex()] = PairedController(controllerId.toHex(), name, key)
-        return PairingCode(deviceId = deviceId, controllerId = controllerId, key = key, broker = brokerConfig, deviceName = "test")
+        registry.add(PairedController.pending(controllerId.toHex(), name, key, System.currentTimeMillis()))
+        return PairingCode(deviceId = deviceId, controllerId = controllerId, key = key, devicePub = deviceSigner.publicKey, broker = brokerConfig, deviceName = "test")
     }
 
-    private fun controller(pairing: PairingCode, ackTimeoutMs: Long = 5_000, log: (String) -> Unit = {}) = ControllerClient(
+    /** A pairing already bound to its signer's key, for tests that talk to the device without a [ControllerClient]. */
+    private fun pairBound(name: String): PairingCode = pair(name).also {
+        assertTrue(registry.bind(it.controllerId.toHex(), signerOf(it.controllerId).publicKey, System.currentTimeMillis()))
+    }
+
+    private fun signerOf(controllerId: ByteArray) = signers.getOrPut(controllerId.toHex()) { SoftwareSigner() }
+
+    /** A started controller; with [bind], it has bound its key as after the scan. */
+    private suspend fun controller(
+        pairing: PairingCode,
+        ackTimeoutMs: Long = 5_000,
+        log: (String) -> Unit = {},
+        bind: Boolean = true,
+        signer: SoftwareSigner = signerOf(pairing.controllerId),
+    ) = ControllerClient(
         pairing = pairing,
-        relay = MqttRelay(brokerConfig, "ctrl-" + pairing.controllerId.toHex().take(8)),
+        signer = signer,
+        relay = MqttRelay(brokerConfig, "ctrl-" + Keys.random(4).toHex()),
         seq = SeqCounter(InMemorySeqStore(), "seq"),
         scope = scope,
         log = log,
         ackTimeoutMs = ackTimeoutMs,
         jobTimeoutMs = 20_000,
-    ).also { it.start() }
+    ).also {
+        it.start()
+        if (bind) {
+            withTimeout(10_000) { it.online.first { online -> online == true } }
+            val bound = assertIs<BindResult.Bound>(it.bind())
+            assertEquals(CommandSignature.fingerprint(signer.publicKey), bound.fingerprint)
+        }
+    }
+
+    @Test
+    fun `a controller binds its key over the relay, and a phone with a photo of the same QR can't bind or press`() = runBlocking {
+        val pairing = pair("phone")
+        assertTrue(registry.find(pairing.controllerId.toHex())!!.pending)
+        val client = controller(pairing)
+        val bound = registry.find(pairing.controllerId.toHex())!!
+        assertContentEquals(signerOf(pairing.controllerId).publicKey, bound.publicKey)
+        assertFalse(bound.pending)
+
+        val thief = controller(pairing, ackTimeoutMs = 2_000, bind = false, signer = SoftwareSigner())
+        withTimeout(10_000) { thief.online.first { it == true } }
+        assertEquals("timeout", assertIs<BindResult.Failed>(thief.bind()).code)
+        assertIs<PressUpdate.Failed>(withTimeout(10_000) { thief.press(delayMs = 0).toList() }.last())
+        assertEquals(0, presses.get())
+        assertContentEquals(signerOf(pairing.controllerId).publicKey, registry.find(pairing.controllerId.toHex())!!.publicKey)
+
+        assertIs<PressUpdate.Photo>(withTimeout(20_000) { client.press(delayMs = 100).toList() }.last())
+        assertEquals(1, presses.get())
+        assertTrue(deviceLog.none { it.contains(bound.fingerprint!!) }, "keys stay out of the device log")
+        client.stop(); thief.stop()
+    }
 
     @Test
     fun `press returns text first, then the photo, and the broker only sees ciphertext`() = runBlocking {
-        val client = controller(pair("phone"))
+        val pairing = pair("phone")
+        val client = controller(pairing)
         withTimeout(10_000) { client.online.first { it == true } }
         withTimeout(10_000) { client.status.first { it != null } }
         assertEquals(77, client.status.value!!.battery)
@@ -247,6 +302,10 @@ class RelayIntegrationTest {
         assertTrue(updates.any { it is PressUpdate.PhotoProgress })
         assertEquals(1, presses.get())
         assertEquals(listOf("prepare", "press", "capture"), hardware, "camera must be woken before the press")
+
+        // Every event is in a version 3 job envelope, signed by the device's key.
+        val events = sniffed.filter { it.first == Topics.evt(deviceHex, pairing.controllerId.toHex()) }
+        assertTrue(events.size >= 5 && events.all { it.second[0] == JobEnvelope.VERSION }, "bound, status, ack, text and photo")
 
         // Everything on the wire except the presence flag is opaque.
         val payloads = sniffed.filterNot { it.first == Topics.online(deviceHex) }
@@ -400,7 +459,7 @@ class RelayIntegrationTest {
     fun `revoked controller is ignored`() = runBlocking {
         val pairing = pair("lost phone")
         registry.remove(pairing.controllerId.toHex())
-        val client = controller(pairing, ackTimeoutMs = 2_000)
+        val client = controller(pairing, ackTimeoutMs = 2_000, bind = false)
         withTimeout(10_000) { client.online.first { it == true } }
         val updates = withTimeout(10_000) { client.press().toList() }
         assertIs<PressUpdate.Failed>(updates.last())
@@ -418,10 +477,13 @@ class RelayIntegrationTest {
 
         val cmdTopic = Topics.cmd(deviceHex, pairing.controllerId.toHex())
         val captured = sniffed.filter { it.first == cmdTopic }.map { it.second }
-        assertTrue(captured.isNotEmpty())
+        assertTrue(captured.size >= 2, "the bind and the press")
+        val key = registry.find(pairing.controllerId.toHex())!!.publicKey
+        val before = deviceLog.count { it == "dropped replayed/stale command from phone" }
         for (payload in captured) sniffer.publish(cmdTopic, payload)
-        delay(1500)
+        withTimeout(10_000) { while (deviceLog.count { it == "dropped replayed/stale command from phone" } < before + captured.size) delay(20) }
         assertEquals(1, presses.get(), "replayed press must not trigger the button")
+        assertContentEquals(key, registry.find(pairing.controllerId.toHex())!!.publicKey)
         client.stop()
     }
 
@@ -447,12 +509,13 @@ class RelayIntegrationTest {
         val evtTopic = Topics.evt(deviceHex, pairing.controllerId.toHex())
         val events = sniffed.filter { it.first == evtTopic }.map { it.second }
         val jobEvents = events.filter { JobEnvelope.deviceEpk(it) != null }
+        assertEquals(events.size, jobEvents.size, "every event goes under a job key")
         assertTrue(jobEvents.size >= 3, "ack, text and photo go under the job key")
-        val command = sniffed.single { it.first == Topics.cmd(deviceHex, pairing.controllerId.toHex()) && runCatching { Codec.decodeCommand(envelope.open(Direction.CMD, it.second)) is Press }.getOrDefault(false) }
-        val epk = assertIs<Press>(Codec.decodeCommand(envelope.open(Direction.CMD, command.second))).epk
+        val signer = signerOf(pairing.controllerId).publicKey
+        val command = sniffed.single { it.first == Topics.cmd(deviceHex, pairing.controllerId.toHex()) && runCatching { Codec.decodeCommand(envelope.openCommand(it.second, signer)) is Press }.getOrDefault(false) }
+        val epk = assertIs<Press>(Codec.decodeCommand(envelope.openCommand(command.second, signer))).epk
         assertNotNull(epk, "the controller sends an ephemeral key with every job")
         for (payload in jobEvents) {
-            assertFailsWith<EnvelopeException> { envelope.open(Direction.EVT, payload) }
             assertFailsWith<EnvelopeException> { envelope.controllerJob(JobKeyPair.generate(), JobEnvelope.deviceEpk(payload)!!).open(payload) }
         }
 
@@ -474,50 +537,67 @@ class RelayIntegrationTest {
     }
 
     @Test
-    fun `an older controller without an ephemeral key gets its events under the pairing key`() = runBlocking {
-        val pairing = pair("old phone")
+    fun `a command without an ephemeral key is dropped, as no event goes under the pairing key`() = runBlocking {
+        val pairing = pairBound("old phone")
         val envelope = pairing.envelope()
         val controllerHex = pairing.controllerId.toHex()
         val received = CopyOnWriteArrayList<ByteArray>()
         val old = MqttRelay(brokerConfig, "old-controller")
         old.subscribe(Topics.evt(deviceHex, controllerHex)) { _, payload -> received += payload }
         startSubscribed(old)
-        val press: Command = Press(System.currentTimeMillis(), System.currentTimeMillis(), "0123456789abcdef", 100)
-        withTimeout(10_000) { old.publish(Topics.cmd(deviceHex, controllerHex), envelope.seal(Direction.CMD, Codec.encode(press))) }
-        withTimeout(20_000) { while (received.none { runCatching { Codec.decodeEvent(envelope.open(Direction.EVT, it)) is PhotoChunk }.getOrDefault(false) }) delay(50) }
-        assertTrue(received.all { it[0] == 1.toByte() })
-        assertIs<Ack>(Codec.decodeEvent(envelope.open(Direction.EVT, received.first())))
+        val now = System.currentTimeMillis()
+        for (command in listOf<Command>(Press(now, now, "0123456789abcdef", 100), StatusRequest(now + 1, now, "fedcba9876543210"))) {
+            withTimeout(10_000) { old.publish(Topics.cmd(deviceHex, controllerHex), envelope.sealCommand(Codec.encode(command), signerOf(pairing.controllerId))) }
+        }
+        withTimeout(10_000) { while (deviceLog.count { it == "dropped command without a job key from old phone" } < 2) delay(20) }
+        delay(300)
+        assertEquals(0, presses.get())
+        assertEquals(emptyList(), received.toList())
         old.stop()
     }
 
     @Test
-    fun `a controller drops job events under the pairing key, as from an older device or a forger with K`() = runBlocking {
-        // An older device, or someone holding K: same pairing, answers without a job key (ADR 0030).
-        val oldDeviceId = Keys.random(16)
+    fun `someone holding K and the relay can't answer in the device's place`() = runBlocking {
+        // A forger with K, a broker credential that publishes events, and the relay, but not the device's key, for a
+        // device that isn't there: it answers every command with a job key of its own, signed by its own key.
+        val absentId = Keys.random(16)
+        val absentHex = absentId.toHex()
         val controllerId = Keys.random(16)
-        val key = Keys.random(32)
-        val pairing = PairingCode(deviceId = oldDeviceId, controllerId = controllerId, key = key, broker = brokerConfig)
+        val pairing = PairingCode(deviceId = absentId, controllerId = controllerId, key = Keys.random(32), devicePub = deviceSigner.publicKey, broker = brokerConfig)
         val envelope = pairing.envelope()
-        val oldHex = oldDeviceId.toHex()
-        val oldDevice = MqttRelay(brokerConfig, "old-device")
-        oldDevice.subscribe(Topics.allCmds(oldHex)) { _, payload ->
-            val command = Codec.decodeCommand(envelope.open(Direction.CMD, payload)) as? JobCommand ?: return@subscribe
+        val forgerKey = SoftwareSigner()
+        val forger = MqttRelay(brokerConfig, "forger")
+        val answered = AtomicInteger()
+        forger.subscribe(Topics.allCmds(absentHex)) { _, payload ->
+            val command = Codec.decodeCommand(envelope.openCommand(payload, signerOf(controllerId).publicKey)) as JobCommand
+            val job = envelope.deviceJob(command.epk!!)
+            val signature = job.sign(command.job, forgerKey)
+            val events = when (command) {
+                is Bind -> listOf(Bound(command.job, CommandSignature.fingerprint(command.pub)))
+                is StatusRequest -> listOf(Status(System.currentTimeMillis(), 1, 20f, false, job = command.job))
+                else -> listOf(Ack(command.job), TextResult(command.job, "654321", true, 0.9f), PhotoChunk(command.job, 0, 1, jpeg.copyOf(1000)))
+            }
             scope.launch {
-                for (event in listOf(Ack(command.job), TextResult(command.job, "654321", true, 0.9f), PhotoChunk(command.job, 0, 1, jpeg.copyOf(1000)))) {
-                    oldDevice.publish(Topics.evt(oldHex, controllerId.toHex()), envelope.seal(Direction.EVT, Codec.encode(event)))
-                }
+                for (event in events) forger.publish(Topics.evt(absentHex, controllerId.toHex()), job.seal(Codec.encode(event), signature))
+                answered.incrementAndGet()
             }
         }
-        startSubscribed(oldDevice)
+        startSubscribed(forger)
+        // It raises the online flag too, which makes the controller ask for a status.
+        forger.publish(Topics.online(absentHex), "1".toByteArray(), retain = true)
         val dropped = CopyOnWriteArrayList<String>()
-        val client = controller(pairing, ackTimeoutMs = 2_000, log = { dropped += it })
-        withTimeout(10_000) { client.connected.first { it } }
+        val client = controller(pairing, ackTimeoutMs = 1_000, log = { dropped += it }, bind = false)
+        withTimeout(10_000) { client.online.first { it == true } }
+        assertEquals("timeout", assertIs<BindResult.Failed>(client.bind()).code)
         val updates = withTimeout(20_000) { client.press(delayMs = 100).toList() }
         assertEquals(listOf(PressUpdate.Sent::class, PressUpdate.Failed::class), updates.map { it::class })
         assertEquals("timeout", (updates.last() as PressUpdate.Failed).code)
-        withTimeout(5_000) { while (dropped.count { it == "dropped version 1 job event" } < 3) delay(20) }
+        // The status asked for on the flag, both binds, and the press: 1 + 2 + 3 events.
+        withTimeout(5_000) { while (dropped.count { it == "dropped event not signed by the device" } < 6) delay(20) }
+        assertNull(client.status.value)
+        assertTrue(answered.get() >= 4)
         client.stop()
-        oldDevice.stop()
+        forger.stop()
     }
 
     private fun ByteArray.containsSequence(needle: ByteArray): Boolean {

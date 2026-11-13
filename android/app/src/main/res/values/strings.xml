@@ -4,5 +4,6 @@
     <string name="device_channel">Device service</string>
     <string name="device_notification">Ready to press</string>
     <string name="device_unlock_notification">Unlock the phone to bring the device back online</string>
+    <string name="device_key_notification">Offline: waiting for the device\'s signing key</string>
     <string name="device_open_app_notification">The device is offline: open the app to see why</string>
 </resources>

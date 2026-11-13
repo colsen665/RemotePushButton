@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import net.rpb.app.common.Mode
 import net.rpb.app.common.Store
@@ -28,6 +29,12 @@ class RpbApp : Application() {
 
     /** Controller results, in memory for 5 minutes and cleared on lock (ADR 0026). */
     val history = History(SystemClock::elapsedRealtime)
+
+    /**
+     * Answers dropped as not signed by the device, per pairing by controller ID, for as long as the process lives
+     * (ADR 0033). Not on disk, and kept over the store closing: the warning must outlast leaving the app.
+     */
+    val forgeries = MutableStateFlow<Map<String, Int>>(emptyMap())
 
     private val _locks = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val locks: SharedFlow<Unit> = _locks

@@ -63,11 +63,16 @@ import java.text.DateFormat
 import java.util.Date
 import kotlin.math.roundToInt
 
+/** [askScreenLock] shows the screen-lock prompt and passes on whether it was passed (ADR 0033). */
 @Composable
-fun ControllerScreen(onSwitchMode: () -> Unit, vm: ControllerViewModel = viewModel()) {
+fun ControllerScreen(onSwitchMode: () -> Unit, askScreenLock: ((Boolean) -> Unit) -> Unit, vm: ControllerViewModel = viewModel()) {
     LifecycleStartEffect(Unit) {
         vm.onStart()
         onStopOrDispose { vm.onStop() }
+    }
+    val ui by vm.ui.collectAsStateWithLifecycle()
+    LaunchedEffect(ui.screenLockNeeded) {
+        if (vm.takeScreenLockRequest()) askScreenLock(vm::onScreenLock)
     }
     var calibrating by remember { mutableStateOf(false) }
     if (calibrating) {
@@ -114,7 +119,8 @@ private fun ControllerHome(vm: ControllerViewModel, onCalibrate: () -> Unit, onS
         if (ui.pairings.isEmpty()) {
             Text("Pair with a device", style = MaterialTheme.typography.headlineSmall)
             Text("On the device phone, open Controllers → Add controller and scan the QR code it shows.")
-            Button(onClick = scan) { Text("Scan pairing QR") }
+            Button(onClick = scan, enabled = ui.binding == null) { Text("Scan pairing QR") }
+            if (ui.binding != null) Text(ui.progress)
             ui.scanError?.let { Text(it, color = Bad) }
             TextButton(onClick = { pinSettings = true }) { Text("PIN lock") }
             TextButton(onClick = onSwitchMode) { Text("This is the device phone…") }
@@ -124,12 +130,40 @@ private fun ControllerHome(vm: ControllerViewModel, onCalibrate: () -> Unit, onS
         if (ui.pairings.size > 1) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ui.pairings.forEachIndexed { i, p ->
-                    FilterChip(selected = i == ui.selected, onClick = { vm.select(i) }, label = { Text(p.name) })
+                    FilterChip(
+                        selected = i == ui.selected,
+                        onClick = { vm.select(i) },
+                        enabled = ui.binding == null,
+                        label = { Text(if (!p.bound && p.code != ui.binding) "${p.name} (pair again)" else p.name) },
+                    )
                 }
             }
         }
         val name = ui.pairings.getOrNull(ui.selected)?.name ?: "Device"
         Text(name, style = MaterialTheme.typography.headlineSmall)
+        if (ui.binding != null && ui.binding == ui.pairings.getOrNull(ui.selected)?.code) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator()
+                Text("Pairing. Keep the QR code open on the device phone.")
+            }
+            if (ui.progress.isNotEmpty()) Text(ui.progress)
+            return@Column
+        }
+        if (ui.needsPairing) {
+            Text("Pair again", style = MaterialTheme.typography.titleMedium, color = Amber)
+            Text(
+                "This pairing was made by an older version of the app, or didn't finish. Each controller now has a key " +
+                    "that only this phone holds. On the device phone, open Controllers → Add controller and scan the " +
+                    "QR code it shows, then remove this one here.",
+            )
+            Button(onClick = scan) { Text("Scan pairing QR") }
+            ui.scanError?.let { Text(it, color = Bad) }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = { confirmRemove = true }) { Text("Remove this device") }
+                TextButton(onClick = onSwitchMode) { Text("Switch mode") }
+            }
+            return@Column
+        }
         val (presence, color) = when {
             !ui.connected -> "Connecting to relay…" to Amber
             ui.online == true -> "Device online" to Good
@@ -137,6 +171,14 @@ private fun ControllerHome(vm: ControllerViewModel, onCalibrate: () -> Unit, onS
             else -> "Device status unknown" to Amber
         }
         Text(presence, color = color)
+        if (ui.forgeries > 0) {
+            Text(
+                "Answers not signed by the device were dropped. Someone holding this pairing's key may be " +
+                    "interfering: revoke this controller on the device and pair again.",
+                style = MaterialTheme.typography.bodySmall,
+                color = Bad,
+            )
+        }
         ui.status?.let { s ->
             Text(
                 "Phone ${s.battery}%${if (s.charging) " ⚡" else ""} · ${"%.1f".format(s.temp)} °C" +
@@ -206,13 +248,20 @@ private fun ControllerHome(vm: ControllerViewModel, onCalibrate: () -> Unit, onS
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = vm::calibrationPhoto, enabled = ui.connected && !ui.running) { Text("Photo only") }
             OutlinedButton(onClick = onCalibrate, enabled = ui.connected && !ui.running) { Text("Calibrate") }
-            OutlinedButton(onClick = scan) { Text("Pair another") }
+            OutlinedButton(onClick = scan, enabled = !ui.running) { Text("Pair another") }
         }
         ui.scanError?.let { Text(it, color = Bad) }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = { confirmRemove = true }) { Text("Remove this device") }
             TextButton(onClick = { pinSettings = true }) { Text("PIN lock") }
             TextButton(onClick = onSwitchMode) { Text("Switch mode") }
+        }
+        ui.fingerprint?.let {
+            Text(
+                "This phone's key fingerprint, as the device lists it under this controller: $it",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 
@@ -269,6 +318,20 @@ private fun ControllerHome(vm: ControllerViewModel, onCalibrate: () -> Unit, onS
                     Text("The device photographs the display ${seconds((value * 1000).roundToInt())} after the Bot presses. Long enough for the display to show the new code.")
                     // Half-second steps up to the device's limit.
                     Slider(value = value, onValueChange = { value = it }, valueRange = 0f..max, steps = (max * 2).toInt() - 1)
+                }
+            },
+        )
+    }
+    ui.bound?.let { bound ->
+        AlertDialog(
+            onDismissRequest = vm::dismissBound,
+            confirmButton = { TextButton(onClick = vm::dismissBound) { Text("Done") } },
+            title = { Text("Paired with ${bound.name}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Check that the device phone shows the same key fingerprint:")
+                    Text(bound.fingerprint, fontFamily = FontFamily.Monospace, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                    Text("If it shows another, remove this device here and the controller on the device phone, then pair again.")
                 }
             },
         )

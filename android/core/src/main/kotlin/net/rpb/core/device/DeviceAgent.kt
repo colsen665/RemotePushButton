@@ -10,9 +10,11 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import net.rpb.core.controller.ControllerClient
-import net.rpb.core.crypto.Direction
+import net.rpb.core.crypto.CommandSignature
+import net.rpb.core.crypto.CommandSignatureException
 import net.rpb.core.crypto.Envelope
 import net.rpb.core.crypto.EnvelopeException
+import net.rpb.core.crypto.Signer
 import net.rpb.core.crypto.hexToBytes
 import net.rpb.core.crypto.toHex
 import net.rpb.core.ocr.Calibration
@@ -26,6 +28,8 @@ import net.rpb.core.ocr.SevenSegResult
 import net.rpb.core.ocr.inRegion
 import net.rpb.core.ocr.moved
 import net.rpb.core.protocol.Ack
+import net.rpb.core.protocol.Bind
+import net.rpb.core.protocol.Bound
 import net.rpb.core.protocol.Busy
 import net.rpb.core.protocol.CalibPhoto
 import net.rpb.core.protocol.CalibrationState
@@ -86,10 +90,94 @@ fun interface StatusSource {
     fun status(): Status
 }
 
-class PairedController(val id: String, val name: String, val key: ByteArray)
+/**
+ * A paired controller (ADR 0033). [publicKey] is the SubjectPublicKeyInfo of its signing key, null until it is bound.
+ * [bindUntil] (device clock, ms) is set while it is pending: the pairing QR is shown and a `bind` is awaited until then.
+ * With neither, it was paired before ADR 0033 or missed its window, and takes no commands: it must be paired again.
+ */
+class PairedController(
+    val id: String,
+    val name: String,
+    val key: ByteArray,
+    val publicKey: ByteArray? = null,
+    val bindUntil: Long? = null,
+) {
+    val bound: Boolean get() = publicKey != null
 
-fun interface ControllerRegistry {
+    /** Waiting for its bind, whether or not the deadline has passed. */
+    val pending: Boolean get() = publicKey == null && bindUntil != null
+
+    /** Whether a `bind` at [now] wins: pending, and the deadline not passed. */
+    fun canBind(now: Long): Boolean = publicKey == null && bindUntil != null && now <= bindUntil
+
+    /** Pending past its deadline: the app removes it (ADR 0033). */
+    fun expired(now: Long): Boolean = pending && now > bindUntil!!
+
+    /** Paired before ADR 0033: no key and never pending. Shown as *Pair again*. */
+    val needsPairingAgain: Boolean get() = publicKey == null && bindUntil == null
+
+    /** The fingerprint both phones show, once bound. */
+    val fingerprint: String? get() = publicKey?.let(CommandSignature::fingerprint)
+
+    /** This controller bound to [publicKey], no longer pending. */
+    fun bound(publicKey: ByteArray) = PairedController(id, name, key, publicKey.copyOf(), null)
+
+    companion object {
+        /** How long a new pairing waits for its bind after the QR appears (ADR 0033). */
+        const val BIND_WINDOW_MS = 10 * 60_000L
+
+        /** A new controller, pending from [now] until [now] + [windowMs]. */
+        fun pending(id: String, name: String, key: ByteArray, now: Long, windowMs: Long = BIND_WINDOW_MS) =
+            PairedController(id, name, key, null, now + windowMs)
+    }
+}
+
+/** The device's paired controllers, as the agent sees them. */
+interface ControllerRegistry {
     fun find(controllerId: String): PairedController?
+
+    /**
+     * Binds [publicKey] to the controller [controllerId] if it [PairedController.canBind] at [now], and saves it; true if
+     * this call bound it. The check and the change are one atomic step, so of two binds at once only one wins, and a
+     * pairing removed meanwhile (its dialog closed) isn't brought back.
+     */
+    fun bind(controllerId: String, publicKey: ByteArray, now: Long): Boolean
+}
+
+/** A [ControllerRegistry] in memory, with the operations the app's store also offers (ADR 0033). */
+class InMemoryControllerRegistry : ControllerRegistry {
+    private val controllers = LinkedHashMap<String, PairedController>()
+
+    @Synchronized
+    fun add(controller: PairedController) {
+        controllers[controller.id] = controller
+    }
+
+    @Synchronized
+    fun remove(controllerId: String): PairedController? = controllers.remove(controllerId)
+
+    /** Removes [controllerId] only if it is still pending: closing the QR dialog before a bind. */
+    @Synchronized
+    fun removeIfPending(controllerId: String): Boolean =
+        controllers[controllerId]?.takeIf { it.pending }?.let { controllers.remove(controllerId) } != null
+
+    /** Removes every pending controller past its deadline; returns their IDs. */
+    @Synchronized
+    fun purgeExpired(now: Long): List<String> =
+        controllers.values.filter { it.expired(now) }.map { it.id }.onEach { controllers.remove(it) }
+
+    @Synchronized
+    fun all(): List<PairedController> = controllers.values.toList()
+
+    @Synchronized
+    override fun find(controllerId: String): PairedController? = controllers[controllerId]
+
+    @Synchronized
+    override fun bind(controllerId: String, publicKey: ByteArray, now: Long): Boolean {
+        val controller = controllers[controllerId]?.takeIf { it.canBind(now) } ?: return false
+        controllers[controllerId] = controller.bound(publicKey)
+        return true
+    }
 }
 
 /** Outcome of one press/photo job, reported to the device UI. */
@@ -105,9 +193,12 @@ data class JobRecord(
 /**
  * The device side of the protocol: receives encrypted commands from paired controllers,
  * presses, waits, photographs, reads the digits and replies with the text first and the photo after.
+ * [signer] is the device's signing key, whose public key is in every pairing code: it signs each job's key exchange,
+ * so that only this device can answer (ADR 0033).
  */
 class DeviceAgent(
     private val deviceId: ByteArray,
+    private val signer: Signer,
     private val relay: Relay,
     private val registry: ControllerRegistry,
     private val replay: ReplayGuard,
@@ -162,16 +253,40 @@ class DeviceAgent(
         null
     }
 
-    /** Authenticates [payload] and checks it isn't replayed; returns what carries it out, or null if it is dropped. */
-    private fun admit(topic: String, payload: ByteArray): (suspend () -> Unit)? {
+    /**
+     * Authenticates [payload] and checks it isn't replayed; returns what carries it out, or null if it is dropped.
+     * Every command must be signed with the controller's bound key; a pending controller takes only a `bind`, signed by
+     * the key it carries, before its deadline; one with neither takes nothing (ADR 0033).
+     */
+    private suspend fun admit(topic: String, payload: ByteArray): (suspend () -> Unit)? {
         val controllerHex = Topics.controllerOfCmd(deviceHex, topic) ?: return null
         val controller = registry.find(controllerHex) ?: run {
             log("ignored command from unknown controller $controllerHex")
             return null
         }
+        val now = clock()
         val envelope = Envelope.forPair(controller.key, deviceId, controllerHex.hexToBytes())
+        var refusal = "not signed by its key"
         val command = try {
-            Codec.decodeCommand(envelope.open(Direction.CMD, payload))
+            Codec.decodeCommand(
+                envelope.openCommand(payload) { cbor ->
+                    controller.publicKey ?: run {
+                        refusal = when {
+                            !controller.pending -> "not bound: pair again"
+                            !controller.canBind(now) -> "past its bind deadline"
+                            else -> {
+                                // The only bytes parsed before their signature is checked: a bind names its own key.
+                                (runCatching { Codec.decodeCommand(cbor) }.getOrNull() as? Bind)?.let { return@openCommand it.pub }
+                                "not a bind, from a pending controller"
+                            }
+                        }
+                        null
+                    }
+                },
+            )
+        } catch (e: CommandSignatureException) {
+            log("dropped command for ${controller.name}: $refusal")
+            return null
         } catch (e: EnvelopeException) {
             log("dropped unauthenticated command for ${controller.name}")
             return null
@@ -179,25 +294,48 @@ class DeviceAgent(
             log("dropped malformed command for ${controller.name}: $e")
             return null
         }
+        // Every event goes under the key of its command's job, which is gone once the job ends (ADR 0030); nothing
+        // goes under the pairing key (ADR 0033). Before the replay guard: a pending controller's bind is signed by
+        // whoever holds the QR, and one that can't be answered must not use up a number, or it would shut out the
+        // real bind for the rest of the window.
+        val job = command as? JobCommand
+        val epk = job?.epk ?: run {
+            log("dropped command without a job key from ${controller.name}")
+            return null
+        }
+        val jobEnvelope = try {
+            envelope.deviceJob(epk)
+        } catch (e: EnvelopeException) {
+            log("dropped command with a bad job key from ${controller.name}")
+            return null
+        }
         if (!replay.accept(controllerHex, command)) {
             log("dropped replayed/stale command from ${controller.name}")
             return null
         }
-        // A job's events go under a key that is gone once the job ends (ADR 0030); older controllers send no epk.
-        val epk = (command as? JobCommand)?.epk
-        val seal: (ByteArray) -> ByteArray = if (epk == null) {
-            { envelope.seal(Direction.EVT, it) }
-        } else {
-            val jobEnvelope = try {
-                envelope.deviceJob(epk)
-            } catch (e: EnvelopeException) {
-                log("dropped command with a bad job key from ${controller.name}")
-                return null
+        // Once per job, and only for a command that passed the replay guard: a replay costs no signature. Off the
+        // caller's thread, which is the main one on Android, as a Keystore signature blocks.
+        val signature = withContext(Dispatchers.IO) { jobEnvelope.sign(job.job, signer) }
+        // Only once the answer can be sealed: a bind the controller never hears of would leave it bound here alone.
+        if (command is Bind) {
+            val bound = controller.publicKey
+            when {
+                bound == null -> if (registry.bind(controllerHex, command.pub, now)) {
+                    log("bound ${controller.name}")
+                } else {
+                    log("refused bind for ${controller.name}: no longer pending")
+                    return null
+                }
+                !bound.contentEquals(command.pub) -> {
+                    log("refused bind for ${controller.name}: already bound")
+                    return null
+                }
+                // Signed by the bound key: a controller whose answer was lost asks again, and gets it again.
+                else -> Unit
             }
-            jobEnvelope::seal
         }
         val reply: suspend (Event) -> Unit = { event ->
-            relay.publish(Topics.evt(deviceHex, controllerHex), seal(Codec.encode(event)))
+            relay.publish(Topics.evt(deviceHex, controllerHex), jobEnvelope.seal(Codec.encode(event), signature))
         }
         return {
             when (command) {
@@ -221,7 +359,8 @@ class DeviceAgent(
                         )
                     }
                 }
-                is StatusRequest -> reply(statusSource.status())
+                is StatusRequest -> reply(statusSource.status().copy(job = command.job))
+                is Bind -> reply(Bound(command.job, CommandSignature.fingerprint(command.pub)))
             }
         }
     }

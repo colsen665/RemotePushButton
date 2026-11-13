@@ -1,6 +1,6 @@
 # 30. A job's events go under a per-job key from ephemeral X25519 keys
 
-- Status: Accepted
+- Status: Accepted; amended by [0033](0033-controllers-bound-to-a-hardware-key.md) (job envelope version 3 signed by the device, `status` as a job, nothing under the pairing key)
 - Date: 2026-11-03
 - Amends: [0006](0006-e2e-crypto-and-qr-pairing.md) (event encryption, the "no forward secrecy" limitation)
 

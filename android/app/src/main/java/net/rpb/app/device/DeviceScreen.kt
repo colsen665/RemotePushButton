@@ -1,7 +1,9 @@
 package net.rpb.app.device
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
@@ -31,23 +33,29 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import net.rpb.app.common.DeviceSettings
 import net.rpb.app.common.PinSettings
@@ -64,7 +72,6 @@ import net.rpb.core.crypto.hexToBytes
 import net.rpb.core.crypto.toHex
 import net.rpb.core.device.Diagnostics
 import net.rpb.core.ocr.SevenSegReader
-import java.util.Base64
 
 private fun devicePermissions(): Array<String> = buildList {
     add(Manifest.permission.CAMERA)
@@ -95,6 +102,7 @@ private fun DeviceHome(onCalibrate: () -> Unit, onSwitchMode: () -> Unit) {
     val settings by store.device.collectAsStateWithLifecycle()
     val controllers by store.controllers.collectAsStateWithLifecycle()
     val running by DeviceRuntime.running.collectAsStateWithLifecycle()
+    val agentState by DeviceRuntime.agentState.collectAsStateWithLifecycle()
     val connected by DeviceRuntime.relayConnected.collectAsStateWithLifecycle()
     val lastJob by DeviceRuntime.lastJob.collectAsStateWithLifecycle()
     val botBattery by DeviceRuntime.botBattery.collectAsStateWithLifecycle()
@@ -119,7 +127,8 @@ private fun DeviceHome(onCalibrate: () -> Unit, onSwitchMode: () -> Unit) {
 
     var testMessage by remember { mutableStateOf<String?>(null) }
     var testPhoto by remember { mutableStateOf<ImageBitmap?>(null) }
-    var pairingQr by remember { mutableStateOf<Pair<String, ImageBitmap>?>(null) }
+    // Saveable, so a rotation keeps the QR dialog and its pending controller.
+    var pairingId by rememberSaveable { mutableStateOf<String?>(null) }
     var askName by remember { mutableStateOf(false) }
     var confirmSwitch by remember { mutableStateOf(false) }
 
@@ -188,14 +197,24 @@ private fun DeviceHome(onCalibrate: () -> Unit, onSwitchMode: () -> Unit) {
 
         Section("Controllers") {
             if (controllers.isEmpty()) Text("No controllers paired yet.")
-            controllers.forEach { c ->
+            controllers.forEach { stored ->
+                val c = stored.paired()
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(c.name, Modifier.weight(1f))
-                    TextButton(onClick = { store.removeController(c.id) }) { Text("Revoke") }
+                    Column(Modifier.weight(1f)) {
+                        Text(c.name)
+                        val fingerprint = c.fingerprint
+                        when {
+                            fingerprint != null -> Text(fingerprint, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+                            c.pending -> Text("Waiting for the controller…", style = MaterialTheme.typography.bodySmall)
+                            else -> Text("Pair again", style = MaterialTheme.typography.bodySmall, color = Bad)
+                        }
+                    }
+                    TextButton(onClick = { store.removeController(c.id) }) { Text(if (c.bound) "Revoke" else "Remove") }
                 }
             }
-            Button(enabled = settings.controllerBroker.host.isNotBlank(), onClick = { askName = true }) { Text("Add controller") }
-            if (settings.controllerBroker.host.isBlank()) Text("Set the controller broker credentials below first.", style = MaterialTheme.typography.bodySmall)
+            val cannotAdd = if (settings.controllerBroker.host.isBlank()) "Set the controller broker credentials below first." else agentState.problem()
+            Button(enabled = cannotAdd == null, onClick = { askName = true }) { Text("Add controller") }
+            cannotAdd?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         }
 
         SettingsSection(settings, onSave = { updated ->
@@ -223,32 +242,13 @@ private fun DeviceHome(onCalibrate: () -> Unit, onSwitchMode: () -> Unit) {
     if (askName) {
         NameDialog(onDismiss = { askName = false }, onConfirm = { name ->
             askName = false
-            val controllerId = Keys.random(Keys.ID_BYTES)
-            val key = Keys.random(Keys.MASTER_KEY_BYTES)
-            store.addController(StoredController(controllerId.toHex(), name, Base64.getEncoder().encodeToString(key), System.currentTimeMillis()))
-            val code = PairingCode(
-                deviceId = settings.deviceId.hexToBytes(),
-                controllerId = controllerId,
-                key = key,
-                broker = settings.controllerBroker,
-                deviceName = settings.name,
-            ).encode()
-            pairingQr = name to Qr.encode(code).asImageBitmap()
+            val id = Keys.random(Keys.ID_BYTES).toHex()
+            // The clock the agent checks the bind deadline against.
+            val controller = StoredController.pending(id, name, Keys.random(Keys.MASTER_KEY_BYTES), System.currentTimeMillis())
+            if (store.addController(controller)) pairingId = id
         })
     }
-    pairingQr?.let { (name, qr) ->
-        AlertDialog(
-            onDismissRequest = { pairingQr = null },
-            confirmButton = { TextButton(onClick = { pairingQr = null }) { Text("Done") } },
-            title = { Text("Scan with \"$name\"") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Image(qr, contentDescription = "Pairing QR code", modifier = Modifier.fillMaxWidth())
-                    Text("Anyone who scans this code can press the button. Close it once paired; revoke the controller if the code leaks.")
-                }
-            },
-        )
-    }
+    pairingId?.let { PairingDialog(it, onClose = { pairingId = null }) }
     if (confirmSwitch) {
         AlertDialog(
             onDismissRequest = { confirmSwitch = false },
@@ -264,6 +264,102 @@ private fun DeviceHome(onCalibrate: () -> Unit, onSwitchMode: () -> Unit) {
             text = { Text("The service stops and remote presses will no longer work.") },
         )
     }
+}
+
+/** Why no controller can be paired now, or null while the agent runs and would answer a bind (ADR 0033). */
+private fun AgentState.problem(): String? = when (this) {
+    AgentState.STOPPED -> "Start the device service first."
+    AgentState.NO_BROKER -> "Set the device's broker below first."
+    AgentState.NO_KEY -> "The device's signing key can't be loaded: restart the app."
+    AgentState.RUNNING -> null
+}
+
+/**
+ * The pairing QR of the pending controller [controllerId], then its fingerprint once it is bound (ADR 0033). The
+ * screen stays on meanwhile. Closing the dialog, its deadline, or the QR leaving the screen (the PIN lock, the screen
+ * turned off, another app) before the bind removes the controller; a rotation doesn't. The QR shows only while the
+ * agent runs, with the key it signs with, so no QR is shown that nothing would answer.
+ */
+@Composable
+private fun PairingDialog(controllerId: String, onClose: () -> Unit) {
+    val context = LocalContext.current
+    val store = context.rpb.store
+    val settings by store.device.collectAsStateWithLifecycle()
+    val controllers by store.controllers.collectAsStateWithLifecycle()
+    val view = LocalView.current
+    DisposableEffect(view) {
+        view.keepScreenOn = true
+        onDispose { view.keepScreenOn = false }
+    }
+    LifecycleStartEffect(controllerId) {
+        onStopOrDispose {
+            if (context.findActivity()?.isChangingConfigurations != true && store.removePendingController(controllerId)) {
+                DeviceRuntime.log("pairing cancelled before the controller bound")
+            }
+        }
+    }
+    val agentState by DeviceRuntime.agentState.collectAsStateWithLifecycle()
+    val devicePub by DeviceRuntime.devicePub.collectAsStateWithLifecycle()
+    val controller = controllers.firstOrNull { it.id == controllerId }?.paired()
+    if (controller == null) {
+        LaunchedEffect(Unit) { onClose() }
+        return
+    }
+    controller.bindUntil?.let { deadline ->
+        LaunchedEffect(deadline) {
+            delay(deadline - System.currentTimeMillis() + 1)
+            // Removes it unless a bind won meanwhile; either way the store's update closes or changes the dialog.
+            if (store.removePendingController(controllerId)) DeviceRuntime.log("pairing expired before the controller bound")
+        }
+    }
+    val fingerprint = controller.fingerprint
+    AlertDialog(
+        onDismissRequest = onClose,
+        confirmButton = { TextButton(onClick = onClose) { Text(if (fingerprint == null) "Cancel" else "Done") } },
+        title = { Text(if (fingerprint == null) "Scan with \"${controller.name}\"" else "Bound") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                val pub = devicePub.takeIf { agentState == AgentState.RUNNING }
+                if (fingerprint == null && pub != null) {
+                    val qr = remember(controllerId, pub) {
+                        val code = PairingCode(
+                            deviceId = settings.deviceId.hexToBytes(),
+                            controllerId = controllerId.hexToBytes(),
+                            key = controller.key,
+                            devicePub = pub,
+                            broker = settings.controllerBroker,
+                            deviceName = settings.name,
+                        ).encode()
+                        Qr.encode(code).asImageBitmap()
+                    }
+                    Image(qr, contentDescription = "Pairing QR code", modifier = Modifier.fillMaxWidth())
+                    Text("Waiting for the controller…")
+                    Text(
+                        "The first phone to scan this code is paired, within 10 minutes. Cancel if someone else may have scanned it.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                } else if (fingerprint == null) {
+                    // The pending controller stays until Cancel or its deadline, so the QR comes back if the agent does.
+                    Text(agentState.problem() ?: "The device's signing key can't be loaded: restart the app.", color = Bad)
+                } else {
+                    Text("\"${controller.name}\" is paired. Its fingerprint:")
+                    Text(fingerprint, style = MaterialTheme.typography.titleMedium, fontFamily = FontFamily.Monospace)
+                    Text(
+                        "Check the controller shows the same. If it doesn't, revoke this controller.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        },
+        // Tapping beside a pending pairing would cancel it.
+        properties = DialogProperties(dismissOnClickOutside = fingerprint != null),
+    )
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }
 
 @Composable

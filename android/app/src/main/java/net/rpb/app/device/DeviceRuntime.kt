@@ -8,9 +8,16 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/** Why the device can or can't answer a controller: the pairing QR shows only while [RUNNING] (ADR 0033). */
+enum class AgentState { STOPPED, NO_BROKER, NO_KEY, RUNNING }
+
 /** Process-wide link between [DeviceService] and the device screens (single-process app). */
 object DeviceRuntime {
     val running = MutableStateFlow(false)
+    val agentState = MutableStateFlow(AgentState.STOPPED)
+
+    /** The public key the agent signs with, which goes in the pairing QR; null until the service has loaded it. */
+    val devicePub = MutableStateFlow<ByteArray?>(null)
     val relayConnected = MutableStateFlow(false)
     val lastJob = MutableStateFlow<JobRecord?>(null)
     val botBattery = MutableStateFlow<Int?>(null)

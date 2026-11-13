@@ -17,6 +17,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -29,12 +30,14 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import net.rpb.app.MainActivity
 import net.rpb.app.R
+import net.rpb.app.common.DeviceKey
 import net.rpb.app.rpb
+import net.rpb.core.crypto.Signer
 import net.rpb.core.crypto.hexToBytes
 import net.rpb.core.device.CalibrationStore
+import net.rpb.core.device.ControllerRegistry
 import net.rpb.core.device.DeviceAgent
 import net.rpb.core.device.Diagnostics
-import net.rpb.core.device.PairedController
 import net.rpb.core.ocr.Calibration
 import net.rpb.core.ocr.DisplayAnchor
 import net.rpb.core.protocol.ReplayGuard
@@ -43,7 +46,6 @@ import net.rpb.core.relay.Topics
 import net.rpb.core.relay.Will
 import net.rpb.core.vault.Vault
 import java.io.File
-import java.util.Base64
 
 /**
  * Keeps the device reachable: relay connection, camera, BLE and the protocol agent.
@@ -59,6 +61,7 @@ class DeviceService : LifecycleService() {
     private var botBatteryAt = 0L
 
     private var unlockReceiver: BroadcastReceiver? = null
+    private var keyRetry: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -70,8 +73,24 @@ class DeviceService : LifecycleService() {
             if (vault == Vault.CLOSED) vault = waitForUnlock()
             if (vault != Vault.OPEN) return@launch giveUp(vault)
             DeviceRuntime.log("key storage: ${store.keyDescription}")
-            startDevice()
+            startDevice(loadSigner())
         }
+    }
+
+    /**
+     * The device's signing key, or null if it can't be loaded now. Only while the store is open: a closed store
+     * shows no controllers, and [DeviceKey] would then replace a key that bound controllers trust. Read under the
+     * store's lock, which its open and close take, so the controllers are the open store's.
+     */
+    private suspend fun loadSigner(): Signer? {
+        val store = rpb.store
+        val bound = synchronized(store) {
+            if (store.vault.value != Vault.OPEN) null else store.controllers.value.any { it.publicKey != null }
+        } ?: return null
+        // DeviceKey keeps only a key that loaded, so each call after a failure tries the Keystore again.
+        return withContext(Dispatchers.IO) { runCatching { DeviceKey.signer(this@DeviceService, bound, DeviceRuntime::log) } }
+            .onFailure { DeviceRuntime.log("device signing key unavailable (${it.javaClass.simpleName})") }
+            .getOrNull()
     }
 
     /**
@@ -111,9 +130,8 @@ class DeviceService : LifecycleService() {
         stopSelf()
     }
 
-    private fun startDevice() {
+    private fun startDevice(signer: Signer?) {
         val store = rpb.store
-        val settings = store.device.value
         val log: (String) -> Unit = DeviceRuntime::log
 
         val bot = BotClient(this, { store.device.value.botMac }, { store.device.value.botPassword }, log)
@@ -121,66 +139,8 @@ class DeviceService : LifecycleService() {
         val camera = CameraCapture(this, this, { store.device.value.torch }, { store.device.value.photoRotation }, log, diagnostics::photo)
         DeviceRuntime.bot = bot
         DeviceRuntime.camera = camera
+        startAgent(signer, bot, camera, diagnostics)
 
-        // The MQTT client rejects an empty host, so without a broker there is no relay and no agent.
-        // Saving the broker settings restarts the service; every other setting is read when used (ADR 0032).
-        val relay = settings.deviceBroker.takeIf { it.host.isNotBlank() }?.let { broker ->
-            MqttRelay(
-                config = broker,
-                clientId = "rpb-dev-" + settings.relayId,
-                will = Will(Topics.online(settings.deviceId), DeviceAgent.OFFLINE),
-                log = log,
-            )
-        }
-        val agent = relay?.let { r ->
-            DeviceAgent(
-                deviceId = settings.deviceId.hexToBytes(),
-                relay = r,
-                registry = { id ->
-                    store.controllers.value.firstOrNull { it.id == id }?.let { PairedController(it.id, it.name, Base64.getDecoder().decode(it.key)) }
-                },
-                replay = ReplayGuard(store.seqStore),
-                presser = {
-                    bot.press()
-                    // The Bot just answered, so a missing or old battery reading is likely to succeed now.
-                    if (System.currentTimeMillis() - botBatteryAt > BOT_BATTERY_INTERVAL_MS) botBatteryRefresh.trySend(Unit)
-                },
-                camera = camera,
-                calibration = object : CalibrationStore {
-                    override fun load() = store.device.value.let { Calibration(it.ocr, it.photoRotation) }
-                    override fun save(calibration: Calibration) {
-                        store.updateDevice { it.copy(ocr = calibration.config, photoRotation = calibration.rotation) }
-                    }
-
-                    override fun anchor() = store.device.value.anchor
-
-                    override fun saveAnchor(anchor: DisplayAnchor) {
-                        store.updateDevice { it.copy(anchor = anchor) }
-                    }
-                },
-                statusSource = BatteryStatus(this) { DeviceRuntime.botBattery.value },
-                scope = lifecycleScope,
-                log = log,
-                onJob = { record ->
-                    DeviceRuntime.lastJob.value = record
-                    store.device.value.let { diagnostics.job(record.job, record.controller, Calibration(it.ocr, it.photoRotation), it.anchor) }
-                    // Never the code: the log goes to logcat (AGENTS.md). The screen shows it under "Last job".
-                    val outcome = record.result?.let { "read ${if (it.valid) "ok" else "invalid"} (confidence ${"%.2f".format(it.confidence)})" } ?: record.error
-                    log("job ${record.job} for ${record.controller}: $outcome")
-                },
-            )
-        }
-        this.agent = agent
-        DeviceRuntime.agent = agent
-
-        lifecycleScope.launch {
-            if (relay == null || agent == null) {
-                log("broker not configured — set it in Settings")
-                return@launch
-            }
-            agent.start()
-            relay.connected.collect { DeviceRuntime.relayConnected.value = it }
-        }
         lifecycleScope.launch {
             while (true) {
                 val level = bot.battery()
@@ -206,7 +166,107 @@ class DeviceService : LifecycleService() {
         log("device service started")
     }
 
+    /**
+     * Without a broker or [signer] no job can be answered, so there is no agent, and the pairing QR isn't shown
+     * ([DeviceRuntime.agentState]). A key that didn't load is tried again until it does, which starts the agent.
+     */
+    private fun startAgent(signer: Signer?, bot: BotClient, camera: CameraCapture, diagnostics: Diagnostics) {
+        val store = rpb.store
+        val settings = store.device.value
+        val log: (String) -> Unit = DeviceRuntime::log
+        DeviceRuntime.devicePub.value = signer?.publicKey
+
+        // The MQTT client rejects an empty host, so without a broker there is no relay and no agent.
+        // Saving the broker settings restarts the service; every other setting is read when used (ADR 0032).
+        if (settings.deviceBroker.host.isBlank()) {
+            log("broker not configured — set it in Settings")
+            DeviceRuntime.agentState.value = AgentState.NO_BROKER
+            return
+        }
+        if (signer == null) {
+            DeviceRuntime.agentState.value = AgentState.NO_KEY
+            updateNotification(getString(R.string.device_key_notification))
+            retrySigner(bot, camera, diagnostics)
+            return
+        }
+        val relay = MqttRelay(
+            config = settings.deviceBroker,
+            clientId = "rpb-dev-" + settings.relayId,
+            will = Will(Topics.online(settings.deviceId), DeviceAgent.OFFLINE),
+            log = log,
+        )
+        val agent = DeviceAgent(
+            deviceId = settings.deviceId.hexToBytes(),
+            signer = signer,
+            relay = relay,
+            registry = object : ControllerRegistry {
+                override fun find(controllerId: String) = store.controllers.value.firstOrNull { it.id == controllerId }?.paired()
+                override fun bind(controllerId: String, publicKey: ByteArray, now: Long) = store.bindController(controllerId, publicKey, now)
+            },
+            replay = ReplayGuard(store.seqStore),
+            presser = {
+                bot.press()
+                // The Bot just answered, so a missing or old battery reading is likely to succeed now.
+                if (System.currentTimeMillis() - botBatteryAt > BOT_BATTERY_INTERVAL_MS) botBatteryRefresh.trySend(Unit)
+            },
+            camera = camera,
+            calibration = object : CalibrationStore {
+                override fun load() = store.device.value.let { Calibration(it.ocr, it.photoRotation) }
+                override fun save(calibration: Calibration) {
+                    store.updateDevice { it.copy(ocr = calibration.config, photoRotation = calibration.rotation) }
+                }
+
+                override fun anchor() = store.device.value.anchor
+
+                override fun saveAnchor(anchor: DisplayAnchor) {
+                    store.updateDevice { it.copy(anchor = anchor) }
+                }
+            },
+            statusSource = BatteryStatus(this) { DeviceRuntime.botBattery.value },
+            scope = lifecycleScope,
+            log = log,
+            onJob = { record ->
+                DeviceRuntime.lastJob.value = record
+                store.device.value.let { diagnostics.job(record.job, record.controller, Calibration(it.ocr, it.photoRotation), it.anchor) }
+                // Never the code: the log goes to logcat (AGENTS.md). The screen shows it under "Last job".
+                val outcome = record.result?.let { "read ${if (it.valid) "ok" else "invalid"} (confidence ${"%.2f".format(it.confidence)})" } ?: record.error
+                log("job ${record.job} for ${record.controller}: $outcome")
+            },
+        )
+        this.agent = agent
+        DeviceRuntime.agent = agent
+        DeviceRuntime.agentState.value = AgentState.RUNNING
+
+        lifecycleScope.launch {
+            agent.start()
+            relay.connected.collect { DeviceRuntime.relayConnected.value = it }
+        }
+    }
+
+    /**
+     * Loads the device's key again after [KEY_RETRY_MS], then every [KEY_RETRY_LAST_MS], and starts the agent once it
+     * loads: in this service, as a restart started from the background could lose the camera (ADR 0009). Cancelled
+     * with the service, in [onDestroy].
+     */
+    private fun retrySigner(bot: BotClient, camera: CameraCapture, diagnostics: Diagnostics) {
+        keyRetry?.cancel()
+        keyRetry = lifecycleScope.launch {
+            var attempt = 0
+            while (true) {
+                delay(KEY_RETRY_MS.getOrElse(attempt++) { KEY_RETRY_LAST_MS })
+                // In Device mode the store stays open while the service runs; should it close, wait rather than ask.
+                rpb.store.vault.first { it == Vault.OPEN }
+                val signer = loadSigner() ?: continue
+                DeviceRuntime.log("device signing key loaded: starting the agent")
+                updateNotification(getString(R.string.device_notification))
+                startAgent(signer, bot, camera, diagnostics)
+                return@launch
+            }
+        }
+    }
+
     override fun onDestroy() {
+        keyRetry?.cancel()
         unlockReceiver?.let(::unregisterReceiver)
         // Clear the online flag before going away; the last will only covers unclean disconnects.
         runBlocking { withTimeoutOrNull(2_000) { agent?.stop() } }
@@ -214,6 +274,8 @@ class DeviceService : LifecycleService() {
         DeviceRuntime.bot = null
         DeviceRuntime.agent = null
         DeviceRuntime.running.value = false
+        DeviceRuntime.agentState.value = AgentState.STOPPED
+        DeviceRuntime.devicePub.value = null
         DeviceRuntime.relayConnected.value = false
         wakeLock?.release()
         wifiLock?.release()
@@ -267,6 +329,8 @@ class DeviceService : LifecycleService() {
         private const val BOT_BATTERY_INTERVAL_MS = 6 * 60 * 60 * 1000L
         private const val BOT_BATTERY_RETRY_MS = 10 * 60 * 1000L
         private const val BOT_BATTERY_AFTER_PRESS_MS = 15_000L
+        private val KEY_RETRY_MS = listOf(10_000L, 60_000L)
+        private const val KEY_RETRY_LAST_MS = 5 * 60 * 1000L
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, DeviceService::class.java))

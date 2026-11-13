@@ -14,9 +14,9 @@ sealed interface Command {
 }
 
 /**
- * A command that starts a job. [epk], if present, is the controller's ephemeral X25519 public key for the job: the
- * device answers the job's events under a key derived from it (ADR 0030). Older controllers leave it out and get
- * their events under the pairing key.
+ * A command that starts a job. [epk] is the controller's ephemeral X25519 public key for the job: the device answers
+ * the job's events under a key derived from it (ADR 0030), and signs the key exchange with [job] (ADR 0033). The
+ * device drops a command without it, as every event now goes under a job's key.
  */
 @Serializable
 sealed interface JobCommand : Command {
@@ -35,9 +35,18 @@ data class Press(
     @ByteString override val epk: ByteArray? = null,
 ) : JobCommand
 
+/**
+ * Asks for the device's [Status], answered as a job of its own (ADR 0033): the fresh [job] and [epk] are what make the
+ * answer fresh, as only this request's job key opens it and the device's signature covers both.
+ */
 @Serializable
 @SerialName("status?")
-data class StatusRequest(override val seq: Long, override val ts: Long) : Command
+data class StatusRequest(
+    override val seq: Long,
+    override val ts: Long,
+    override val job: String,
+    @ByteString override val epk: ByteArray? = null,
+) : JobCommand
 
 /**
  * Take a photo and read it, for calibrating remotely. With [pressDelayMs], press first and wait that long, so the
@@ -63,6 +72,20 @@ data class SetCalibration(
     val calibration: Calibration,
     val pressDelayMs: Int? = null,
     @ByteString override val epk: ByteArray? = null,
+) : JobCommand
+
+/**
+ * The first command after the scan (ADR 0033): binds [pub], the X.509 SubjectPublicKeyInfo of the controller's signing
+ * key for this pairing, and is signed by that key. The device answers [Bound] under the job key from [epk].
+ */
+@Serializable
+@SerialName("bind")
+data class Bind(
+    override val seq: Long,
+    override val ts: Long,
+    override val job: String,
+    @ByteString override val epk: ByteArray,
+    @ByteString val pub: ByteArray,
 ) : JobCommand
 
 /** Device → controller. */
@@ -99,6 +122,11 @@ data class TextResult(
 @SerialName("calib")
 data class CalibrationState(val job: String, val calibration: Calibration) : Event
 
+/** The device's answer to [Bind]: the key is bound, with this [fingerprint] ([net.rpb.core.crypto.CommandSignature.fingerprint]). */
+@Serializable
+@SerialName("bound")
+data class Bound(val job: String, val fingerprint: String) : Event
+
 @Serializable
 @SerialName("photo")
 class PhotoChunk(val job: String, val i: Int, val n: Int, @ByteString val bytes: ByteArray) : Event
@@ -107,6 +135,7 @@ class PhotoChunk(val job: String, val i: Int, val n: Int, @ByteString val bytes:
 @SerialName("error")
 data class ErrorEvent(val job: String? = null, val code: String, val msg: String = "") : Event
 
+/** The answer to the [StatusRequest] whose [job] it names; the device's [net.rpb.core.device.StatusSource] leaves [job] null. */
 @Serializable
 @SerialName("status")
 data class Status(
@@ -116,6 +145,7 @@ data class Status(
     val charging: Boolean,
     val botBattery: Int? = null,
     val rssi: Int? = null,
+    val job: String? = null,
 ) : Event
 
 object ErrorCodes {

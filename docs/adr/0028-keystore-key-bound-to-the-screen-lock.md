@@ -1,6 +1,6 @@
 # 28. The Keystore key needs the screen lock; both phones keep one; the device needs an unlock after a reboot
 
-- Status: Accepted
+- Status: Accepted; amended by [0033](0033-controllers-bound-to-a-hardware-key.md) (a signing key per pairing on the controller, a signing key on the device)
 - Date: 2026-11-03
 - Amends: [0002](0002-old-android-phone-as-device.md) and [0009](0009-device-app-as-home-launcher.md) (the device no longer recovers from a reboot on its own), [0006](0006-e2e-crypto-and-qr-pairing.md) (keys at rest), [0015](0015-app-pin-lock-with-optional-wipe.md) (what the app PIN protects against), [0024](0024-relay-hardening-and-release-builds.md) (the device phone's screen lock)
 

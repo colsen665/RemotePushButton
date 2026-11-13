@@ -9,6 +9,8 @@ import net.rpb.core.ocr.Point
 import net.rpb.core.ocr.SevenSegConfig
 import net.rpb.core.ocr.rowRegion
 import net.rpb.core.protocol.Ack
+import net.rpb.core.protocol.Bind
+import net.rpb.core.protocol.Bound
 import net.rpb.core.protocol.CalibPhoto
 import net.rpb.core.protocol.CalibrationState
 import net.rpb.core.protocol.ChunkAssembler
@@ -42,13 +44,15 @@ class ProtocolTest {
         // The controllers' default differs from the wire default, so it must travel (ADR 0019).
         val waitLonger = Press(seq = 5, ts = 1000, job = "ab12", delayMs = ControllerClient.DEFAULT_DELAY_MS)
         assertEquals(ControllerClient.DEFAULT_DELAY_MS, (Codec.decodeCommand(Codec.encode(waitLonger)) as Press).delayMs)
-        assertEquals(StatusRequest(6, 2000), Codec.decodeCommand(Codec.encode(StatusRequest(6, 2000))))
+        assertEquals(StatusRequest(6, 2000, "mn34"), Codec.decodeCommand(Codec.encode(StatusRequest(6, 2000, "mn34"))))
 
         val text = TextResult("ab12", "123456", true, 0.8f, listOf(DigitResult("1", 0.9f)), pressedAt = 10, capturedAt = 1010)
         assertEquals(text, Codec.decodeEvent(Codec.encode(text)))
         assertEquals(Ack("x"), Codec.decodeEvent(Codec.encode(Ack("x"))))
         val status = Status(1, 80, 31.5f, true, 97, -60)
         assertEquals(status, Codec.decodeEvent(Codec.encode(status)))
+        // A status names the request it answers (ADR 0033).
+        assertEquals(status.copy(job = "mn34"), Codec.decodeEvent(Codec.encode(status.copy(job = "mn34"))))
 
         val calibration = Calibration(SevenSegConfig(digits = 6, slant = 0.07f), rotation = 270)
         val set = SetCalibration(7, 3000, "cd34", calibration)
@@ -70,6 +74,16 @@ class ProtocolTest {
         assertNull((Codec.decodeCommand(Codec.encode(press)) as Press).epk)
         assertContentEquals(epk, (Codec.decodeCommand(Codec.encode(CalibPhoto(11, 7000, "kl12", epk = epk))) as CalibPhoto).epk)
         assertContentEquals(epk, (Codec.decodeCommand(Codec.encode(set.copy(epk = epk))) as SetCalibration).epk)
+
+        // A bind carries its job key and the signing key it binds, both as byte strings (ADR 0033).
+        val pub = SoftwareSigner().publicKey
+        val bind = assertIs<Bind>(Codec.decodeCommand(Codec.encode(Bind(12, 8000, "mn34", epk, pub))))
+        assertEquals(listOf(12L, 8000L), listOf(bind.seq, bind.ts))
+        assertEquals("mn34", bind.job)
+        assertContentEquals(epk, bind.epk)
+        assertContentEquals(pub, bind.pub)
+        assertTrue(Codec.encode(bind).size < pub.size + epk.size + 80, "byte strings, not arrays of ints")
+        assertEquals(Bound("mn34", "0123 4567 89ab cdef"), Codec.decodeEvent(Codec.encode(Bound("mn34", "0123 4567 89ab cdef"))))
 
         val bytes = Random(1).nextBytes(1000)
         val chunk = Codec.decodeEvent(Codec.encode(PhotoChunk("j", 0, 1, bytes)))

@@ -31,6 +31,8 @@ The debug build (`:app:assembleDebug`, `app-debug.apk`) is for pulling diagnosti
 
 **Updating from a build before ADR 0028:** set a screen lock on the phone first (§4 step 1, §5 step 1), then install over the old build. On its first start the app asks for the screen lock and moves the pairings to the new key; nothing needs pairing again.
 
+**Updating from a build before ADR 0033:** update the device phone and every controller phone, then pair every controller again (§5): each pairing is now bound to a signing key on its controller phone and to the device's own signing key, carried in the new QR codes, and old pairings take no commands. The device lists them as *Pair again*; **Remove** them there, and remove the old pairing on the controller phone. An older app refuses the new QR codes, and the new app refuses QR codes from an older device app.
+
 The top line of every screen shows the installed build: `Build <n> · <commit> · <time>` is the number of commits, the commit (with `+` if built with uncommitted changes) and the build time.
 
 ## 3. SwitchBot Bot
@@ -75,13 +77,18 @@ The top line of every screen shows the installed build: `Build <n> · <commit> �
    - Keep the phone out of direct sun and enclosed warm spots, and check the battery for swelling now and then.
 
 ## 5. Controller phone(s)
-1. On the device phone: **Controllers → Add controller**, enter a name, and keep the QR code on screen.
-2. On the controller phone: make sure it has a **screen lock** (ADR 0028). Install the APK and open it; it asks for the screen lock. Choose **Controller**, tap **Scan pairing QR**, then close the QR dialog on the device.
+1. On the device phone: **Controllers → Add controller**, enter a name, and keep the QR code on screen. The screen stays on while the QR dialog shows.
+2. On the controller phone: make sure it has a **screen lock** (ADR 0028). Install the APK and open it; it asks for the screen lock. Choose **Controller** and tap **Scan pairing QR** within 10 min of the QR appearing. The controller binds its new signing key to the pairing, and the device's QR dialog turns from *Waiting for the controller…* to *Bound* (ADR 0033).
+   - **Compare the fingerprints:** both phones show four groups of four characters. They must match. If the device shows *Bound* and the controller doesn't, or the fingerprints differ, another phone scanned the QR first (Troubleshooting). Then close the QR dialog on the device.
+   - Closing the dialog before the controller has bound, letting it leave the screen (turning the screen off, the app PIN lock, another app), or waiting more than 10 min, removes the pairing: add the controller again.
+   - Later, the controller shows its fingerprint for the selected device at the bottom of its screen, as *This phone's key fingerprint, as the device lists it under this controller*; the device lists each controller's fingerprint under **Controllers**.
    - The app forgets its keys when it leaves the screen (60 s after, with an app PIN) and asks for the screen lock again if the phone was unlocked more than 30 s before.
+   - A press more than 5 min after the phone's screen lock was last passed shows the screen-lock prompt first, then goes through: the signing key works only within 5 min of it (ADR 0033).
 3. Optional: **PIN lock** sets an app PIN for this phone, asked after the screen lock. The screen lock already protects the keys; the app PIN adds a second step for someone handed the unlocked phone.
 4. Calibrate the device from here, if it isn't yet (§4 step 8): tap **Calibrate**. With **Press the button first** ticked, the device presses, waits the delay set for it and sends a photo. Enter the code in the photo, tap **Find digits**, then **Save**. The device saves the calibration, presses again and answers with its own read and a fresh photo.
 5. Tap **PRESS**. The code appears with a **Copy** button, and the photo follows below. The device photographs the display 3 s after the press; if the photo still shows the old code, tap **Photo 3 s after the press** and set a longer wait (up to 10 s, kept for each device).
-6. A lost phone? Use **Revoke** on the device phone. Then, on EMQX, change the `rpb-controllers` password, enter it in the device's Settings, **Save**, and pair the remaining controllers again with new QR codes: the old password stays in the lost phone and would still let it reach the broker (ADR 0024).
+6. **Erasing the device app's data** (a wipe after wrong app PINs, **Erase and start again**, or an uninstall) also replaces the device's signing key, so every controller must be paired again: remove the device on each controller and add it again with a new QR (ADR 0033).
+7. A lost phone? Use **Revoke** on the device phone. Then, on EMQX, change the `rpb-controllers` password, enter it in the device's Settings, **Save**, and pair the remaining controllers again with new QR codes: the old password stays in the lost phone and would still let it reach the broker (ADR 0024).
 
 ## Troubleshooting
 | Symptom | Check |
@@ -98,5 +105,12 @@ The top line of every screen shows the installed build: `Build <n> · <commit> �
 | Reads fail and the log doesn't say why | Install the debug build on the device phone (§2; uninstall first, and pair again). Turn on **Save diagnostics** in the device's Settings and press a few times. Then `adb shell run-as net.rpb.app ls files/diagnostics` lists each photo (`<ms>-photo-t<turn>.jpg`, turn it `<turn>`° clockwise to be upright) and each job's calibration (`<ms>-job-<id>.json`); copy one with `adb exec-out run-as net.rpb.app cat files/diagnostics/<name> > <name>`. The photos show codes: turn it off afterwards, which deletes them (ADR 0023), and put the release build back (ADR 0024) |
 | Ack timeout | The phones' clocks: commands are rejected if they differ by more than 120 s |
 | "Device offline" after a power cut or a reboot; the notification says *Unlock the phone…* | The device phone waits at its lock screen: unlock it (ADR 0028) |
+| The device log says *device signing key missing, unreadable or wrong, and kept* | The phone's Keystore couldn't use the device's signing key, and the device answers nothing meanwhile: the notification says it is waiting for the key, and **Add controller** is off. The device tries again after 10 s, 1 min, then every 5 min, and comes online once the key loads. Restart the app, or the phone. If it stays so, the key is lost: **Revoke** every controller, then pair them again (§5), which makes a new key (ADR 0033) |
+| *Pair again* next to a controller on the device | It was paired before ADR 0033, and its presses are dropped. **Remove** it, remove the pairing on the controller phone, and pair it again (§5) |
+| *Binding failed: show the QR again on the device* on the controller | The QR dialog was closed or left the screen (screen off, app PIN lock, another app), or more than 10 min passed: add the controller again on the device and scan the new QR. If the device's dialog shows *Bound*, see the next row |
+| The device shows *Bound* but the controller failed to bind, or the fingerprints differ | Another phone scanned the QR first and is bound in its place. **Revoke** that controller on the device and add it again, keeping the QR out of sight of cameras |
+| *The device bound another phone's key to this pairing* on the controller | As in the row above: unless another phone of yours scanned the same QR, someone holding the code bound first. **Revoke** that controller on the device and add it again |
+| *Answers not signed by the device were dropped* on the controller | Answers came for this device that only someone holding the pairing's key could make, without the device's signature (ADR 0033). They were dropped, so the codes shown are the device's own. **Revoke** this controller on the device, remove the device on the controller, and pair again (§5); if a lost phone held the pairing, rotate the controller credential too (§5 step 7). The warning shows until the pairing is removed or the app's process ends. It also shows on every answer if the device had to replace its signing key; the device log then says *new device signing key: every controller paired before must pair again*, and the remedy is the same |
+| The controller refuses the pairing QR | One of the two apps is older than ADR 0033: update the one the message names |
 | "Set a screen lock first" | The phone has no screen lock; set one, then **Try again** |
 | "The app's data can't be opened" | The screen lock was removed, which destroys the app's key. **Erase and start again**, then set up and pair again |

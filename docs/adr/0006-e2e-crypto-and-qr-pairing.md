@@ -1,6 +1,6 @@
 # 6. End-to-end crypto: XChaCha20-Poly1305 (Tink), per-direction keys, QR pairing
 
-- Status: Accepted; amended by [0024](0024-relay-hardening-and-release-builds.md) (revoking a lost phone also rotates the controller credential), [0028](0028-keystore-key-bound-to-the-screen-lock.md) (the Keystore key needs the screen lock), [0029](0029-strongbox-where-available.md) (StrongBox where available) and [0030](0030-forward-secrecy-for-job-events.md) (per-job keys for events)
+- Status: Accepted; amended by [0024](0024-relay-hardening-and-release-builds.md) (revoking a lost phone also rotates the controller credential), [0028](0028-keystore-key-bound-to-the-screen-lock.md) (the Keystore key needs the screen lock), [0029](0029-strongbox-where-available.md) (StrongBox where available), [0030](0030-forward-secrecy-for-job-events.md) (per-job keys for events) and [0033](0033-controllers-bound-to-a-hardware-key.md) (signed commands and events, pairing code version 2)
 - Date: 2026-10-15
 
 ## Context

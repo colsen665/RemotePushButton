@@ -103,19 +103,7 @@ class KeystoreBox(private val context: Context) : KeyWrapper {
      * Where the key lives, for the PIN lock dialog: "StrongBox", "hardware", "software", or "unknown" when the
      * Keystore doesn't say; null if there is no key.
      */
-    fun storage(): String? = keyInfo()?.let { info ->
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            when (info.securityLevel) {
-                KeyProperties.SECURITY_LEVEL_STRONGBOX -> "StrongBox"
-                KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT, KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE -> "hardware"
-                KeyProperties.SECURITY_LEVEL_SOFTWARE -> "software"
-                else -> "unknown"
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            if (info.isInsideSecureHardware) "hardware" else "software"
-        }
-    }
+    fun storage(): String? = keyInfo()?.let(::storageOf)
 
     override fun describe(): String {
         val info = keyInfo() ?: return "no key"
@@ -136,3 +124,17 @@ class KeystoreBox(private val context: Context) : KeyWrapper {
         const val AUTH_WINDOW_S = 30
     }
 }
+
+/** Where a Keystore key lives: "StrongBox", "hardware", "software", or "unknown" when the Keystore doesn't say. */
+internal fun storageOf(info: KeyInfo): String =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        when (info.securityLevel) {
+            KeyProperties.SECURITY_LEVEL_STRONGBOX -> "StrongBox"
+            KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT, KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE -> "hardware"
+            KeyProperties.SECURITY_LEVEL_SOFTWARE -> "software"
+            else -> "unknown"
+        }
+    } else {
+        @Suppress("DEPRECATION")
+        if (info.isInsideSecureHardware) "hardware" else "software"
+    }

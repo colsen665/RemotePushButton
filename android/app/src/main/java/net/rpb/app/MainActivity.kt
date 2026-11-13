@@ -83,7 +83,7 @@ class MainActivity : ComponentActivity() {
                                 when (mode) {
                                     null -> ModeChooser(onPick = app::applyMode)
                                     Mode.DEVICE -> DeviceScreen(onSwitchMode = { app.applyMode(null) })
-                                    Mode.CONTROLLER -> ControllerScreen(onSwitchMode = { app.applyMode(null) })
+                                    Mode.CONTROLLER -> ControllerScreen(onSwitchMode = { app.applyMode(null) }, askScreenLock = screenLock::ask)
                                 }
                             }
                         }
